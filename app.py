@@ -340,6 +340,7 @@ async def handle_message(update: Update, context):
                 save_project_data()
 
                 try:
+                    # حذف دکمه‌های تایید بعد از ارسال بازخورد
                     await context.bot.edit_message_reply_markup(
                         chat_id=user_chat_id,
                         message_id=replied_message_id,
@@ -1051,7 +1052,7 @@ def build_application():
         RENDER_URL = os.environ.get("RENDER_URL")
         if not RENDER_URL:
              raise ValueError("❌ خطای پیکربندی: متغیر محیطی RENDER_URL تنظیم نشده است.")
-             
+
         WEBHOOK_URL = RENDER_URL + "/" + TELEGRAM_BOT_TOKEN
 
         # ساخت Application
@@ -1110,8 +1111,15 @@ async def set_initial_webhook():
 @app.route('/' + TELEGRAM_BOT_TOKEN, methods=['POST'])
 async def telegram_webhook():
     """هندلر Webhook برای دریافت پیام‌های تلگرام."""
+    global application
+
+    # اگر Application بنا به دلایلی (مانند خطای Worker) ساخته نشده باشد.
     if not application:
         return {"status": "error", "message": "Application not initialized"}, 500
+
+    # ⭐️ رفع خطای حیاتی Gunicorn:
+    # متد initialize باید قبل از process_update در Workerهای Gunicorn فراخوانی شود.
+    await application.initialize()
 
     # ۱. دریافت داده و تبدیل به JSON
     update_json = request.get_json(force=True)
@@ -1132,7 +1140,7 @@ async def telegram_webhook():
 # ۸. منطق اجرای Gunicorn (اجرای خودکار Webhook در Startup)
 # --------------------------------------------------------------------------------------------------
 
-# این بخش هنگام اجرای Gunicorn فراخوانی می‌شود
+# این بخش هنگام اجرای Gunicorn (وقتی app:app فراخوانی می‌شود) اجرا می‌شود
 if __name__ != '__main__':
     # ساخت Application و Handlers
     build_application()
@@ -1141,6 +1149,8 @@ if __name__ != '__main__':
     # از آنجایی که Gunicorn به صورت همزمان شروع می‌شود، set_webhook باید در یک حلقه رویداد موقت اجرا شود.
     if application:
         try:
+            # از آنجایی که این دستور فقط یکبار در هر Worker اجرا می‌شود،
+            # نیاز است تا Webhook تنظیم شود.
             asyncio.run(set_initial_webhook())
         except RuntimeError:
             # اگر حلقه رویداد قبلاً اجرا شده باشد (مانند Worker های دیگر Gunicorn)
