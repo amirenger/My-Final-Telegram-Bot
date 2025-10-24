@@ -1119,7 +1119,14 @@ async def telegram_webhook():
 
     # ⭐️ رفع خطای حیاتی Gunicorn:
     # متد initialize باید قبل از process_update در Workerهای Gunicorn فراخوانی شود.
-    await application.initialize()
+    # این فراخوانی شامل get_me() است که اطلاعات ربات را بازیابی می‌کند.
+    try:
+        await application.initialize()
+    except Exception as e:
+        # اگر initialize به دلیل مشکلات شبکه/حلقه رویداد شکست خورد، آن را لاگ کرده و ادامه می‌دهد.
+        # (اگرچه در کد جدید احتمال آن کمتر است، اما برای تحمل خطا این را نگه می‌داریم.)
+        logger.error(f"❌ خطای initialize: {e}")
+
 
     # ۱. دریافت داده و تبدیل به JSON
     update_json = request.get_json(force=True)
@@ -1137,24 +1144,17 @@ async def telegram_webhook():
 
 
 # --------------------------------------------------------------------------------------------------
-# ۸. منطق اجرای Gunicorn (اجرای خودکار Webhook در Startup)
+# ۸. منطق اجرای Gunicorn (اصلاح شده)
 # --------------------------------------------------------------------------------------------------
 
 # این بخش هنگام اجرای Gunicorn (وقتی app:app فراخوانی می‌شود) اجرا می‌شود
 if __name__ != '__main__':
-    # ساخت Application و Handlers
+    # 1. ساخت Application و Handlers
     build_application()
 
-    # ⚠️ تنظیم Webhook هنگام شروع Gunicorn
-    # از آنجایی که Gunicorn به صورت همزمان شروع می‌شود، set_webhook باید در یک حلقه رویداد موقت اجرا شود.
-    if application:
-        try:
-            # از آنجایی که این دستور فقط یکبار در هر Worker اجرا می‌شود،
-            # نیاز است تا Webhook تنظیم شود.
-            asyncio.run(set_initial_webhook())
-        except RuntimeError:
-            # اگر حلقه رویداد قبلاً اجرا شده باشد (مانند Worker های دیگر Gunicorn)
-            logger.warning("RuntimeError: asyncio.run failed (event loop already running).")
+    # ⚠️ حذف بلوک asyncio.run(set_initial_webhook())
+    # دلیل: این بلوک باعث تداخل حلقه رویداد (RuntimeError: Event loop is closed) در Workerهای Gunicorn می‌شد.
+    # Webhook قبلاً در Deploy قبلی با موفقیت تنظیم شده است و ما از initialize() در هر درخواست استفاده می‌کنیم.
 
 
 # این بخش فقط برای اجرای محلی است و در Render اجرا نمی‌شود
