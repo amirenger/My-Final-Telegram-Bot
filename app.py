@@ -1086,4 +1086,4 @@ async def handle_webhook():
         
     return jsonify({"status": "ok"})
 
-# نکته: نیازی به 'if __name__ == "__main__":' نیست، زیرا Gunicorn ربات را اجرا می‌کند.
+# نکته: نیازی به 'if __name__ == "__main__":' نیست، زیرا Gunicorn ربات را ا اجرا می‌کند.
