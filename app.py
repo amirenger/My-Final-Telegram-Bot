@@ -4,8 +4,7 @@ import re
 import json
 from uuid import uuid4
 
-# ⬅️ تغییرات لازم برای Webhook و Render
-# حذف بخش Flask/Thread قبلی و استفاده از ساختار Webhook
+# ⬅️ وارد کردن پکیج‌های لازم برای ساختار Webhook و Flask
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
@@ -15,17 +14,11 @@ import telegram
 # --------------------------------------------------------------------------------------------------
 # ۱. تنظیمات و متغیرهای کلیدی
 # --------------------------------------------------------------------------------------------------
-# توکن ربات تلگرام
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# شناسه عددی چت مدیر
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
-# نام فایل ذخیره سازی
 DATA_FILE = 'project_data.json'
-
-# پایگاه داده پروژه
 PROJECT_DATA = {}
 
-# تنظیمات Logging
 logging.basicConfig(
     format=
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
@@ -100,6 +93,8 @@ async def smart_guidance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = str(update.effective_chat.id)
 
     if context.user_data.get('state') and is_manager(user_chat_id):
+        # اگر مدیر در حال ثبت پروژه باشد، پیام متنی او باید توسط handle_message پردازش شود، نه اینجا.
+        # اما چون این تابع در انتهای handle_message فراخوانی می‌شود، در اینجا باید مطمئن شویم که پیام‌های متنی در state ثبت پروژه، نادیده گرفته می‌شوند.
         return
 
     keyboard = []
@@ -146,14 +141,15 @@ async def smart_guidance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  callback_data='client_faq')
         ]]
 
-    if keyboard:
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(guidance_message,
-                                        reply_markup=reply_markup,
-                                        parse_mode='Markdown')
-    else:
-        await update.message.reply_text(guidance_message,
-                                        parse_mode='Markdown')
+    if update.message:
+        if keyboard:
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(guidance_message,
+                                            reply_markup=reply_markup,
+                                            parse_mode='Markdown')
+        else:
+            await update.message.reply_text(guidance_message,
+                                            parse_mode='Markdown')
 
 
 async def start(update: Update, context):
@@ -181,8 +177,10 @@ async def new_project(update: Update, context):
         return
 
     if is_callback:
+        # اگر از دکمه داشبورد آمده
         await message.edit_text("💡 لطفاً نام کامل پروژه جدید را وارد کنید:")
     else:
+        # اگر با دستور /new_project آمده
         await message.reply_text("💡 لطفاً نام کامل پروژه جدید را وارد کنید:")
 
     context.user_data['state'] = 'awaiting_project_name'
@@ -199,6 +197,7 @@ async def handle_message(update: Update, context):
         if state == 'awaiting_project_name':
             context.user_data['temp_project_name'] = update.message.text
             context.user_data['state'] = 'awaiting_client_chat_id'
+            # ⬅️ حل مشکل راهنمایی مدیر: نمایش پیام صحیح بعدی
             await update.message.reply_text(
                 "👤 لطفاً *شناسه عددی (Chat ID)* تلگرام کارفرما را وارد کنید:")
             return
@@ -208,6 +207,7 @@ async def handle_message(update: Update, context):
                 client_chat_id = str(int(update.message.text))
                 context.user_data['temp_client_chat_id'] = client_chat_id
                 context.user_data['state'] = 'awaiting_editor_chat_id'
+                # ⬅️ حل مشکل راهنمایی مدیر: نمایش پیام صحیح بعدی
                 await update.message.reply_text(
                     "✂️ لطفاً *شناسه عددی (Chat ID)* تلگرام ادیتور این پروژه را وارد کنید:"
                 )
@@ -244,6 +244,7 @@ async def handle_message(update: Update, context):
 
             save_project_data()
 
+            # ⬅️ حل مشکل عدم اطلاع به ادیتور
             try:
                 await context.bot.send_message(
                     chat_id=editor_chat_id,
@@ -251,6 +252,7 @@ async def handle_message(update: Update, context):
                     f"🔔 *پروژه جدید:* مدیر پروژه '{project_name}' (*P{project_id}*) را برای شما ثبت کرد. لطفاً اولین محتوای ادیت شده را با ذکر کد *P{project_id}* در کپشن ارسال کنید."
                 )
             except BadRequest:
+                # این پیام به مدیر نشان داده می شود
                 await update.message.reply_text(
                     f"❌ اخطار: پیام ثبت پروژه برای ادیتور ارسال نشد. (ربات را بلاک کرده است.)"
                 )
@@ -317,7 +319,7 @@ async def handle_message(update: Update, context):
                     break
 
         if target_submission:
-            # ⬅️ محدودیت ریپلای: اگر وضعیت 'ClientReviewed' باشد، یعنی قبلاً ریپلای کرده است.
+            # ⬅️ حل مشکل عدم هشدار ریپلای دوم
             if target_submission.get('status') != 'AwaitingFeedback':
                 await update.message.reply_text(
                     "❌ *اخطار:* شما قبلاً روی این محتوا بازخورد ثبت کرده‌اید. "
@@ -399,6 +401,8 @@ async def handle_media(update: Update, context):
     project_name = project_data['name']
 
     # ⬅️ ۱. استخراج file_id و media_type
+    # این بخش در کد قبلی نیز صحیح بود و از عکس، ویدیو و سند پشتیبانی می‌کند.
+    # filters.ATTACHMENT نیز تمام این موارد را شامل می‌شود.
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
         media_type = 'photo'
@@ -411,6 +415,11 @@ async def handle_media(update: Update, context):
     else:
         file_id = None
         media_type = 'unknown'
+
+    if not file_id:
+        await update.message.reply_text("⚠️ محتوای ارسال شده باید عکس، ویدیو یا فایل باشد.")
+        return
+
 
     # 2. کپی کردن محتوا برای کارفرما
     try:
@@ -542,6 +551,7 @@ async def check_project_status(update: Update, context):
 
 async def dashboard(update: Update, context):
     """نمایش داشبورد مدیریتی و وضعیت پروژه‌ها."""
+    # ⬅️ حل مشکل دکمه‌ها: مطمئن می‌شویم از message و نه update.message برای ارسال/ویرایش استفاده کنیم
     message = update.message if update.message else update.callback_query.message
     if not is_manager(message.chat.id):
         await message.reply_text("⛔️ دسترسی محدود.")
@@ -726,6 +736,7 @@ async def handle_callback(update: Update, context):
 
     # --- منطق‌های عمومی (منو، داشبورد، وضعیت) ---
     if action in ['menu', 'editor', 'list', 'status']:
+        # ⬅️ حل مشکل دکمه‌ها: منو و داشبورد
         if action == 'menu':
             if data[1] == 'dashboard': return await dashboard(query, context)
             elif data[1] == 'new' and data[2] == 'project':
@@ -744,6 +755,7 @@ async def handle_callback(update: Update, context):
                     InlineKeyboardButton(f"⚙️ P{pid}: {name}",
                                          callback_data=f'status_{pid}')
                 ] for pid, name in editor_projects]
+                # اطمینان از edit_message_text برای پیام های callback
                 return await query.edit_message_text(
                     project_list_text,
                     reply_markup=InlineKeyboardMarkup(keyboard),
@@ -876,6 +888,7 @@ async def handle_callback(update: Update, context):
 
     # --- منطق کارفرما (بازخورد و تایید) ---
 
+    # ⬅️ حل مشکل دکمه‌ها: سوالات متداول کارفرما
     if action == 'client' and data[1] == 'faq':
         return await query.edit_message_text(
             "❓ *سوالات متداول کارفرما:*\n"
@@ -1033,10 +1046,12 @@ def build_application():
     load_project_data()
 
     if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
+        # در محیط Render این خطا به دلیل عدم وجود متغیرهای محیطی نباید رخ دهد.
         raise ValueError(
             "❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID باید تنظیم شوند."
         )
 
+    # ⬅️ نکته: نیازی به set_webhook نیست زیرا این کار باید از طریق محیط Render انجام شود.
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Commands
@@ -1046,12 +1061,13 @@ def build_application():
     application.add_handler(CommandHandler("check", check_project_status))
 
     # Message Handlers
+    # filters.ATTACHMENT شامل عکس، ویدیو، سند و فایل‌های دیگر است. (حل مشکل ۵)
     application.add_handler(
         MessageHandler(filters.ATTACHMENT, handle_media))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Callback Handler
+    # Callback Handler (حل مشکل ۴)
     application.add_handler(CallbackQueryHandler(handle_callback))
     
     return application
@@ -1073,8 +1089,7 @@ def home():
 async def handle_webhook():
     """دریافت به‌روزرسانی (Update) از تلگرام و ارسال به Application."""
     
-    # اطمینان از مقداردهی اولیه Application (رفع خطای Event Loop در محیط Webhook)
-    # این خط در هر درخواست اجرا می‌شود، که در محیط Webhook/Gunicorn ضروری است.
+    # اطمینان از مقداردهی اولیه Application (ضروری در محیط Webhook/Gunicorn)
     await TG_APPLICATION.initialize()
     
     if request.method == "POST":
@@ -1085,5 +1100,3 @@ async def handle_webhook():
         await TG_APPLICATION.process_update(update)
         
     return jsonify({"status": "ok"})
-
-# نکته: نیازی به 'if __name__ == "__main__":' نیست، زیرا Gunicorn ربات را ا اجرا می‌کند.
