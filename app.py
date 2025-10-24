@@ -1,32 +1,24 @@
 import logging
+import os
+import re
+import json
+from uuid import uuid4
+
+# ⬅️ تغییرات لازم برای Webhook و Render
+# حذف بخش Flask/Thread قبلی و استفاده از ساختار Webhook
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
-import re
-from uuid import uuid4
-import json
-import os
 import telegram
-# ⬅️ تغییرات مهم برای Webhook:
-from flask import Flask, request
-import asyncio
 
 # --------------------------------------------------------------------------------------------------
-# ۱. تنظیمات و متغیرهای کلیدی (گلوبال)
+# ۱. تنظیمات و متغیرهای کلیدی
 # --------------------------------------------------------------------------------------------------
-
-# کد Flask برای Webhook
-app = Flask(__name__)
-
-# این متغیرها در global scope تعریف می‌شوند
-application = None
-WEBHOOK_URL = None
-
 # توکن ربات تلگرام
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# شناسه عددی چت مدیر (به صورت عدد، داخل رشته)
+# شناسه عددی چت مدیر
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
-
 # نام فایل ذخیره سازی
 DATA_FILE = 'project_data.json'
 
@@ -35,12 +27,13 @@ PROJECT_DATA = {}
 
 # تنظیمات Logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
+    format=
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
     level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------------------
-# ۱.۵. توابع مدیریت داده (ذخیره سازی)
+# ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی)
 # --------------------------------------------------------------------------------------------------
 
 
@@ -340,7 +333,6 @@ async def handle_message(update: Update, context):
                 save_project_data()
 
                 try:
-                    # حذف دکمه‌های تایید بعد از ارسال بازخورد
                     await context.bot.edit_message_reply_markup(
                         chat_id=user_chat_id,
                         message_id=replied_message_id,
@@ -1033,131 +1025,65 @@ async def handle_callback(update: Update, context):
 
 
 # --------------------------------------------------------------------------------------------------
-# ۶. توابع ساخت و اجرای Webhook (هسته جدید)
+# ۶. اجرای نهایی ربات و ثبت Handlers (ساختار Webhook)
 # --------------------------------------------------------------------------------------------------
-
 
 def build_application():
-    """هسته اصلی ساخت و پیکربندی ربات."""
-    global application, WEBHOOK_URL
-    try:
-        load_project_data()
+    """Application را برای Webhook می‌سازد و Handlers را ثبت می‌کند."""
+    load_project_data()
 
-        if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
-            raise ValueError(
-                "❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_CHAT_ID باید تنظیم شوند."
-            )
+    if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
+        raise ValueError(
+            "❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID باید تنظیم شوند."
+        )
 
-        # ⚠️ تنظیم آدرس Webhook:
-        RENDER_URL = os.environ.get("RENDER_URL")
-        if not RENDER_URL:
-             raise ValueError("❌ خطای پیکربندی: متغیر محیطی RENDER_URL تنظیم نشده است.")
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-        WEBHOOK_URL = RENDER_URL + "/" + TELEGRAM_BOT_TOKEN
+    # Commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("new_project", new_project))
+    application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("check", check_project_status))
 
-        # ساخت Application
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Message Handlers
+    application.add_handler(
+        MessageHandler(filters.ATTACHMENT, handle_media))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-        # Commands
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("new_project", new_project))
-        application.add_handler(CommandHandler("dashboard", dashboard))
-        application.add_handler(CommandHandler("check", check_project_status))
+    # Callback Handler
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    return application
 
-        # Message Handlers
-        application.add_handler(
-            MessageHandler(filters.ATTACHMENT, handle_media))
-        application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# ⬅️ هسته اصلی Flask و Webhook
+# Gunicorn این نمونه 'app' را اجرا می کند.
+app = Flask(__name__)
+# Application ربات در خارج از تابع build_application ساخته می‌شود.
+TG_APPLICATION = build_application()
 
-        # Callback Handler
-        application.add_handler(CallbackQueryHandler(handle_callback))
+# ⬅️ آدرس پینگ/Keep Alive (مسیر ریشه /)
+@app.route('/', methods=['GET'])
+def home():
+    """پاسخ به پینگ UptimeRobot."""
+    return "Hello. I am alive!"
 
-        logger.info("🤖 پیکربندی Application با موفقیت انجام شد.")
-        return application
+# ⬅️ آدرس Webhook اصلی (با استفاده از توکن به عنوان مسیر)
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+async def handle_webhook():
+    """دریافت به‌روزرسانی (Update) از تلگرام و ارسال به Application."""
+    
+    # اطمینان از مقداردهی اولیه Application (رفع خطای Event Loop در محیط Webhook)
+    # این خط در هر درخواست اجرا می‌شود، که در محیط Webhook/Gunicorn ضروری است.
+    await TG_APPLICATION.initialize()
+    
+    if request.method == "POST":
+        # دریافت داده JSON از درخواست تلگرام
+        update = Update.de_json(request.get_json(force=True), TG_APPLICATION.bot)
+        
+        # پردازش آپدیت به صورت ناهمگام (Async)
+        await TG_APPLICATION.process_update(update)
+        
+    return jsonify({"status": "ok"})
 
-    except Exception as e:
-        logger.error(f"❌ خطای حیاتی در پیکربندی ربات: {e}")
-        return None
-
-
-async def set_initial_webhook():
-    """تنظیم اولیه وب‌هوک در سرور تلگرام."""
-    global application, WEBHOOK_URL
-
-    if not application:
-        logger.error("❌ Application در دسترس نیست. تنظیم Webhook لغو شد.")
-        return
-
-    url = WEBHOOK_URL
-
-    try:
-        # ⭐️ این کار آسنکرون انجام می‌شود
-        await application.bot.set_webhook(url=url, allowed_updates=Update.ALL_TYPES)
-
-        logger.info(f"🤖 ربات با موفقیت برای Webhook تنظیم شد. URL: {url}")
-        print(f"🤖 ربات با موفقیت برای Webhook تنظیم شد. URL: {url}")
-
-    except Exception as e:
-        logger.error(f"❌ خطای حیاتی در تنظیم Webhook: {e}")
-        print(f"❌ خطای حیاتی در تنظیم Webhook: {e}")
-
-
-# --------------------------------------------------------------------------------------------------
-# ۷. توابع Flask و نقطه ورودی Webhook
-# --------------------------------------------------------------------------------------------------
-
-# نقطه ورودی Webhook در Render
-@app.route('/' + TELEGRAM_BOT_TOKEN, methods=['POST'])
-async def telegram_webhook():
-    """هندلر Webhook برای دریافت پیام‌های تلگرام."""
-    global application
-
-    # اگر Application بنا به دلایلی (مانند خطای Worker) ساخته نشده باشد.
-    if not application:
-        return {"status": "error", "message": "Application not initialized"}, 500
-
-    # ⭐️ رفع خطای حیاتی Gunicorn:
-    # متد initialize باید قبل از process_update در Workerهای Gunicorn فراخوانی شود.
-    # این فراخوانی شامل get_me() است که اطلاعات ربات را بازیابی می‌کند.
-    try:
-        await application.initialize()
-    except Exception as e:
-        # اگر initialize به دلیل مشکلات شبکه/حلقه رویداد شکست خورد، آن را لاگ کرده و ادامه می‌دهد.
-        # (اگرچه در کد جدید احتمال آن کمتر است، اما برای تحمل خطا این را نگه می‌داریم.)
-        logger.error(f"❌ خطای initialize: {e}")
-
-
-    # ۱. دریافت داده و تبدیل به JSON
-    update_json = request.get_json(force=True)
-
-    # ۲. تبدیل JSON به شیء Update تلگرام و پردازش
-    try:
-        update = Update.de_json(update_json, application.bot)
-        # ۳. پردازش Update توسط Application
-        await application.process_update(update)
-    except Exception as e:
-        logger.error(f"❌ خطای پردازش Update: {e}")
-        return 'error'
-
-    return 'ok'
-
-
-# --------------------------------------------------------------------------------------------------
-# ۸. منطق اجرای Gunicorn (اصلاح شده)
-# --------------------------------------------------------------------------------------------------
-
-# این بخش هنگام اجرای Gunicorn (وقتی app:app فراخوانی می‌شود) اجرا می‌شود
-if __name__ != '__main__':
-    # 1. ساخت Application و Handlers
-    build_application()
-
-    # ⚠️ حذف بلوک asyncio.run(set_initial_webhook())
-    # دلیل: این بلوک باعث تداخل حلقه رویداد (RuntimeError: Event loop is closed) در Workerهای Gunicorn می‌شد.
-    # Webhook قبلاً در Deploy قبلی با موفقیت تنظیم شده است و ما از initialize() در هر درخواست استفاده می‌کنیم.
-
-
-# این بخش فقط برای اجرای محلی است و در Render اجرا نمی‌شود
-if __name__ == '__main__':
-    build_application()
-    print("❌ در حالت Gunicorn اجرا نشده. این حالت فقط برای توسعه محلی است. برای Deploy از 'gunicorn app:app' استفاده کنید.")
+# نکته: نیازی به 'if __name__ == "__main__":' نیست، زیرا Gunicorn ربات را اجرا می‌کند.
