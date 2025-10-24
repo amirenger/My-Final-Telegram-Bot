@@ -1,54 +1,50 @@
 import logging
+import os
+import json
+import re
+from uuid import uuid4
+import telegram
+
+# ⬅️ مطمئن شوید این خطوط در بالای فایل هستند:
+from flask import Flask, request # ⭐️ `request` برای دریافت داده از تلگرام ضروری است
+
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
-import re
-from uuid import uuid4
-import json
-import os
-import telegram
-# ⬅️ مطمئن شوید این خطوط در بالای فایل هستند:
-from flask import Flask, request # <--- ADDED 'request'
-# from threading import Thread # <--- REMOVED
-
-# -----------------
-# کد Flask برای اجرای سرور Webhook (به جای بیدار نگه داشتن)
-# -----------------
-app = Flask('')
-
-
-@app.route('/')
-def home():
-    """پاسخ به پینگ و Health Check رندر."""
-    # این پیام به Render می‌گوید که سرور فعال است.
-    return "Hello. I am alive!"
+# ❌ خطوط زیر حذف شده‌اند زیرا برای Render/Gunicorn غیرضروری هستند و تداخل ایجاد می‌کنند:
+# from threading import Thread
 
 # --------------------------------------------------------------------------------------------------
-# ۱. تنظیمات و متغیرهای کلیدی (⚠️ این ۳ مورد را جایگزین کنید)
+# ۱. تنظیمات و متغیرهای کلیدی و محیطی
 # --------------------------------------------------------------------------------------------------
+
 # توکن ربات تلگرام
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# شناسه عددی چت مدیر (به صورت عدد، داخل رشته)
-# ⬅️ شناسه مدیر از متغیر محیطی 'MANAGER_ID' خوانده می‌شود.
+# شناسه عددی چت مدیر
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
+# URL عمومی سرویس Render (باید از متغیر محیطی Render خوانده شود)
+WEBHOOK_URL = os.environ.get("RENDER_URL") 
 # نام فایل ذخیره سازی
 DATA_FILE = 'project_data.json'
-
-# آدرس عمومی سرویس شما در Render (باید در متغیرهای محیطی Render تعریف شود)
-RENDER_URL = os.environ.get("RENDER_URL")
-# مسیر Webhook (بر اساس توکن)
-WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
-
 
 # پایگاه داده پروژه
 PROJECT_DATA = {}
 
 # تنظیمات Logging
 logging.basicConfig(
-    format=
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
     level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ----------------------------------------------------------------
+# تنظیمات Flask و Webhook
+# ----------------------------------------------------------------
+app = Flask(__name__) # ⭐️ تعریف اپلیکیشن Flask
+
+@app.route('/')
+def home():
+    """پاسخ به پینگ سرور Render/Gunicorn."""
+    return "OK"
 
 # --------------------------------------------------------------------------------------------------
 # ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی)
@@ -106,10 +102,11 @@ def is_manager(chat_id):
 
 # --------------------------------------------------------------------------------------------------
 # ۲. توابع Handlers (مدیریت جریان کار)
+# (هیچ تغییر منطقی در این توابع نیاز نیست)
 # --------------------------------------------------------------------------------------------------
 
-
 async def smart_guidance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ... (بدنه تابع smart_guidance دست نخورده باقی می‌ماند)
     """پاسخ هوشمند به پیام‌های خارج از دستور با نمایش دکمه‌های راهنما بر اساس نقش پویا."""
 
     if update.callback_query:
@@ -207,6 +204,7 @@ async def new_project(update: Update, context):
 
 
 async def handle_message(update: Update, context):
+# ... (بدنه تابع handle_message دست نخورده باقی می‌ماند)
     """مدیریت پیام‌های متنی در طول فرآیند ثبت پروژه، تغییر نقش و بازخورد."""
     user_chat_id = str(update.effective_chat.id)
     state = context.user_data.get('state')
@@ -380,6 +378,7 @@ async def handle_message(update: Update, context):
 
 
 async def handle_media(update: Update, context):
+# ... (بدنه تابع handle_media دست نخورده باقی می‌ماند)
     """[وظیفه Ediitor]: مدیریت ارسال فایل‌های رسانه‌ای، عکس، ویدیو و سند (Document) همراه با کپشن."""
 
     user_chat_id = str(update.effective_chat.id)
@@ -479,11 +478,13 @@ async def handle_media(update: Update, context):
 
 # --------------------------------------------------------------------------------------------------
 # ۳. توابع گزارش‌گیری و داشبورد
+# ... (بدنه توابع دست نخورده باقی می‌ماند)
 # --------------------------------------------------------------------------------------------------
 
 
 async def get_status_text(project_id, data, user_chat_id):
     """تولید پیام وضعیت پروژه."""
+    # ... (بدنه تابع دست نخورده باقی می‌ماند)
 
     is_manager_user = is_manager(user_chat_id)
 
@@ -606,6 +607,7 @@ async def dashboard(update: Update, context):
 
 # --------------------------------------------------------------------------------------------------
 # ۴. توابع ارسال مدیا و نوتیفیکیشن
+# ... (بدنه توابع دست نخورده باقی می‌ماند)
 # --------------------------------------------------------------------------------------------------
 
 
@@ -731,6 +733,7 @@ async def send_media_to_editor(context, editor_chat_id, project_id, submission,
 
 # --------------------------------------------------------------------------------------------------
 # ۵. توابع Callback Handler (مدیریت کلیک دکمه‌ها)
+# ... (بدنه توابع دست نخورده باقی می‌ماند)
 # --------------------------------------------------------------------------------------------------
 
 
@@ -1043,73 +1046,74 @@ async def handle_callback(update: Update, context):
 
 
 # --------------------------------------------------------------------------------------------------
-# ۶. اجرای نهایی ربات و ثبت Handlers (ساختار Webhook برای Render)
+# ۶. توابع Webhook و اجرای آسنکرون (بخش مهم و اصلاح شده)
 # --------------------------------------------------------------------------------------------------
 
-def setup_bot_handlers():
-    """هسته اصلی اجرای ربات و تنظیم Webhook."""
-    try:
-        load_project_data()
-
-        if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID or not RENDER_URL:
-            # در این حالت، اگر متغیرها تنظیم نشده باشند، Gunicorn نباید شروع شود.
-            # برای اطمینان از خروج صحیح، می‌توانیم خطای پیکربندی را نشان دهیم.
-            raise ValueError(
-                "❌ خطای پیکربندی: مقادیر BOT_TOKEN، MANAGER_ID و RENDER_URL باید در متغیرهای محیطی Render تنظیم شوند."
-            )
-
-        application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-        # Commands (هندلرهای شما)
-        application.add_handler(CommandHandler("start", start))
-        application.add_handler(CommandHandler("new_project", new_project))
-        application.add_handler(CommandHandler("dashboard", dashboard))
-        application.add_handler(CommandHandler("check", check_project_status))
-
-        # Message Handlers
-        application.add_handler(
-            MessageHandler(filters.ATTACHMENT, handle_media))
-        application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-        # Callback Handler
-        application.add_handler(CallbackQueryHandler(handle_callback))
-        
-        # ⬅️ مهم: تنظیم Webhook (این کار فقط یک بار در هنگام استقرار انجام می‌شود)
-        WEBHOOK_URL = RENDER_URL + WEBHOOK_PATH
-        application.bot.set_webhook(url=WEBHOOK_URL)
-        
-        print(f"🤖 ربات با موفقیت برای Webhook تنظیم شد. URL: {WEBHOOK_URL}")
-        
-        return application
-
-    except Exception as e:
-        print(f"❌ خطای حیاتی در اجرای ربات: {e}")
-        return None
-
-# اجرای منطق اصلی ربات
-bot_application = setup_bot_handlers()
-
-# ⬅️ مهم: ساخت مسیر Webhook برای Flask App
-if bot_application:
+def build_application():
+    """تنظیم هندلرها و ساخت شیء Application."""
     
-    # 1. تابع Webhook که آپدیت‌ها را از تلگرام دریافت و به ربات منتقل می‌کند
-    # این تابع توسط Gunicorn اجرا می‌شود
-    async def telegram_webhook():
-        # بررسی متد درخواست
-        if request.method == "POST":
-            # دریافت داده JSON از تلگرام
-            data = request.get_json(force=True)
-            # تبدیل داده به شیء Update تلگرام
-            update = Update.de_json(data, bot_application.bot)
-            # پردازش آپدیت توسط هندلرهای ربات
-            await bot_application.process_update(update)
-            # پاسخ موفقیت آمیز به تلگرام
-            return 'ok'
-        # برای سایر متدها، مانند GET، پاسخ پیش فرض /home را برمی‌گرداند.
-        return home()
+    if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
+        raise ValueError("❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID باید تنظیم شوند.")
+    
+    # استفاده از WebhookHandler برای دریافت به روز رسانی از Flask
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # 2. اضافه کردن مسیر Webhook به Flask App
-    app.add_url_rule(WEBHOOK_PATH, methods=['POST', 'GET'], view_func=telegram_webhook)
+    # Commands
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("new_project", new_project))
+    application.add_handler(CommandHandler("dashboard", dashboard))
+    application.add_handler(CommandHandler("check", check_project_status))
 
-# ⬅️ حذف کامل if __name__ == '__main__': (زیرا Gunicorn مستقیماً شیء app را اجرا می‌کند)
+    # Message Handlers
+    application.add_handler(MessageHandler(filters.ATTACHMENT, handle_media))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Callback Handler
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    return application
+
+# ⭐️ ساخت Application خارج از توابع دیگر
+application = build_application()
+
+
+@app.route(f'/{TELEGRAM_BOT_TOKEN}', methods=['POST'])
+async def telegram_webhook():
+    """هندلر وب‌هوک تلگرام. داده‌های دریافتی از تلگرام را پردازش می‌کند."""
+    # ⭐️ استفاده از await برای خواندن بدنه JSON (ضروری)
+    update_data = await request.get_json(force=True)
+    update = Update.de_json(update_data, application.bot)
+    
+    # ⭐️ استفاده از await برای پردازش به‌روزرسانی (ضروری)
+    await application.process_update(update) 
+    return "ok"
+
+
+async def set_initial_webhook():
+    """تنظیم اولیه وب‌هوک در سرور تلگرام."""
+    url = WEBHOOK_URL + "/" + TELEGRAM_BOT_TOKEN
+    
+    # ⭐️ رفع خطای RuntimeWarning: با استفاده از await
+    await application.bot.set_webhook(url=url, allowed_updates=Update.ALL_TYPES)
+    
+    print(f"🤖 ربات با موفقیت برای Webhook تنظیم شد. URL: {url}")
+
+
+def run_webhook_setup():
+    """فراخوانی تنظیم وب‌هوک پس از شروع gunicorn."""
+    
+    load_project_data() # بارگذاری داده‌ها
+
+    # اجرای تابع آسنکرون set_initial_webhook پس از شروع سرور
+    # این اطمینان می‌دهد که set_webhook در یک حلقه رویداد (Event Loop) اجرا شود.
+    application.job_queue.run_once(
+        callback=lambda context: context.application.create_task(set_initial_webhook()),
+        when=1 
+    )
+
+
+# ----------------------------------------------------------------
+# نقطه ورود نهایی برای اجرای Gunicorn
+# ----------------------------------------------------------------
+if __name__ == '__main__':
+    run_webhook_setup()
