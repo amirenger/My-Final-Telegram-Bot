@@ -8,35 +8,23 @@ import json
 import os
 import telegram
 # ⬅️ مطمئن شوید این خطوط در بالای فایل هستند:
-from flask import Flask
-from threading import Thread
+from flask import Flask, request # <--- ADDED 'request'
+# from threading import Thread # <--- REMOVED
 
 # -----------------
-# کد Flask برای بیدار نگه داشتن Replit
+# کد Flask برای اجرای سرور Webhook (به جای بیدار نگه داشتن)
 # -----------------
 app = Flask('')
 
 
 @app.route('/')
 def home():
-    """پاسخ به پینگ UptimeRobot."""
-    # این پیام به UptimeRobot می‌گوید که سرور فعال است.
+    """پاسخ به پینگ و Health Check رندر."""
+    # این پیام به Render می‌گوید که سرور فعال است.
     return "Hello. I am alive!"
 
-
-def run():
-    """اجرای سرور Flask روی هاست و پورت پیش فرض Replit."""
-    app.run(host='0.0.0.0', port=8080)
-
-
-def keep_alive():
-    """اجرای سرور Flask در یک Thread جداگانه."""
-    t = Thread(target=run)
-    t.start()
-
-
 # --------------------------------------------------------------------------------------------------
-# ۱. تنظیمات و متغیرهای کلیدی (⚠️ این ۲ مورد را جایگزین کنید)
+# ۱. تنظیمات و متغیرهای کلیدی (⚠️ این ۳ مورد را جایگزین کنید)
 # --------------------------------------------------------------------------------------------------
 # توکن ربات تلگرام
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -45,6 +33,12 @@ TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
 # نام فایل ذخیره سازی
 DATA_FILE = 'project_data.json'
+
+# آدرس عمومی سرویس شما در Render (باید در متغیرهای محیطی Render تعریف شود)
+RENDER_URL = os.environ.get("RENDER_URL")
+# مسیر Webhook (بر اساس توکن)
+WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
+
 
 # پایگاه داده پروژه
 PROJECT_DATA = {}
@@ -1049,30 +1043,30 @@ async def handle_callback(update: Update, context):
 
 
 # --------------------------------------------------------------------------------------------------
-# ۶. اجرای نهایی ربات و ثبت Handlers
+# ۶. اجرای نهایی ربات و ثبت Handlers (ساختار Webhook برای Render)
 # --------------------------------------------------------------------------------------------------
 
-
-def main():
-    """هسته اصلی اجرای ربات."""
+def setup_bot_handlers():
+    """هسته اصلی اجرای ربات و تنظیم Webhook."""
     try:
         load_project_data()
 
-        if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
+        if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID or not RENDER_URL:
+            # در این حالت، اگر متغیرها تنظیم نشده باشند، Gunicorn نباید شروع شود.
+            # برای اطمینان از خروج صحیح، می‌توانیم خطای پیکربندی را نشان دهیم.
             raise ValueError(
-                "❌ خطای پیکربندی: مقادیر TELEGRAM_BOT_TOKEN و MANAGER_CHAT_ID باید در کد تنظیم شوند."
+                "❌ خطای پیکربندی: مقادیر BOT_TOKEN، MANAGER_ID و RENDER_URL باید در متغیرهای محیطی Render تنظیم شوند."
             )
 
         application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-        # Commands
+        # Commands (هندلرهای شما)
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("new_project", new_project))
         application.add_handler(CommandHandler("dashboard", dashboard))
         application.add_handler(CommandHandler("check", check_project_status))
 
         # Message Handlers
-        # ⬅️ رفع خطای Document: استفاده از filters.ATTACHMENT که شامل عکس، ویدیو و فایل‌های سند است.
         application.add_handler(
             MessageHandler(filters.ATTACHMENT, handle_media))
         application.add_handler(
@@ -1080,15 +1074,42 @@ def main():
 
         # Callback Handler
         application.add_handler(CallbackQueryHandler(handle_callback))
-
-        keep_alive()
-
-        print("🤖 ربات با موفقیت فعال شد. (مدیر: " + MANAGER_CHAT_ID + ")")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # ⬅️ مهم: تنظیم Webhook (این کار فقط یک بار در هنگام استقرار انجام می‌شود)
+        WEBHOOK_URL = RENDER_URL + WEBHOOK_PATH
+        application.bot.set_webhook(url=WEBHOOK_URL)
+        
+        print(f"🤖 ربات با موفقیت برای Webhook تنظیم شد. URL: {WEBHOOK_URL}")
+        
+        return application
 
     except Exception as e:
         print(f"❌ خطای حیاتی در اجرای ربات: {e}")
+        return None
 
+# اجرای منطق اصلی ربات
+bot_application = setup_bot_handlers()
 
-if __name__ == '__main__':
-    main()
+# ⬅️ مهم: ساخت مسیر Webhook برای Flask App
+if bot_application:
+    
+    # 1. تابع Webhook که آپدیت‌ها را از تلگرام دریافت و به ربات منتقل می‌کند
+    # این تابع توسط Gunicorn اجرا می‌شود
+    async def telegram_webhook():
+        # بررسی متد درخواست
+        if request.method == "POST":
+            # دریافت داده JSON از تلگرام
+            data = request.get_json(force=True)
+            # تبدیل داده به شیء Update تلگرام
+            update = Update.de_json(data, bot_application.bot)
+            # پردازش آپدیت توسط هندلرهای ربات
+            await bot_application.process_update(update)
+            # پاسخ موفقیت آمیز به تلگرام
+            return 'ok'
+        # برای سایر متدها، مانند GET، پاسخ پیش فرض /home را برمی‌گرداند.
+        return home()
+
+    # 2. اضافه کردن مسیر Webhook به Flask App
+    app.add_url_rule(WEBHOOK_PATH, methods=['POST', 'GET'], view_func=telegram_webhook)
+
+# ⬅️ حذف کامل if __name__ == '__main__': (زیرا Gunicorn مستقیماً شیء app را اجرا می‌کند)
