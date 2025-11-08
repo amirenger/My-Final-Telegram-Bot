@@ -913,10 +913,11 @@ async def handle_callback(update: Update, context):
         await query.edit_message_text(
             f"✅ *تایید شد!* این محتوا برای تایید نهایی مدیر ارسال شد.")
 
-        # ⬅️ **اصلاحیه مورد ۱:** ارسال پیام فوری به ادیتور
+        # ⬅️ **حل مشکل نوتیفیکیشن:** ارسال پیام فوری به ادیتور
         try:
             editor_chat_id = project_data['editor_chat_id']
             project_name = project_data['name']
+            # 🎉 این پیام به ادیتور اطلاع می‌دهد که کارفرما تایید کرده است
             await context.bot.send_message(
                 editor_chat_id,
                 f"🔔 *اطلاعیه:* کارفرما محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_name}* را تایید کرد. محتوا برای تایید نهایی مدیر ارسال شده است.",
@@ -926,6 +927,7 @@ async def handle_callback(update: Update, context):
             logger.error(f"Error sending immediate client approval notification to editor: {e}")
         # ⬅️ **پایان اصلاحیه**
         
+        # ⬅️ این تابع نوتیفیکیشن (با دکمه تایید نهایی) را برای مدیر ارسال می‌کند
         await send_to_manager_for_review(context, project_id,
                                          target_submission,
                                          project_data['name'],
@@ -960,9 +962,12 @@ async def handle_callback(update: Update, context):
         feedback_list = "\n".join(
             [f"  - {fb}" for fb in target_submission['feedback']])
         editor_message_prefix = f"❌ *نیاز به بازبینی:* محتوای شما نیاز به اصلاح دارد.\n\n*بازخوردهای کارفرما:*\n{feedback_list}\n\n*لطفاً پس از اصلاح، فایل جدید را مجدداً با کد پروژه ارسال کنید.*"
+        
+        # ⬅️ نوتیفیکیشن همراه با ارسال مدیا به ادیتور (حل مشکل نوتیفیکیشن)
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
+        # ⬅️ نوتیفیکیشن برای کارفرما
         await context.bot.send_message(
             project_data['client_chat_id'],
             f"🔄 *اطلاعیه:* بازخورد شما برای محتوای (ID: {submission_id}) توسط مدیر تایید شد و برای اصلاح به ادیتور بازگشت.",
@@ -993,12 +998,15 @@ async def handle_callback(update: Update, context):
         )
 
         editor_message_prefix = f"✅ *تایید نهایی:* محتوای شما نهایی و تایید شد (علی‌رغم بازخورد کارفرما، مدیر آن را نهایی کرد)."
+        
+        # ⬅️ نوتیفیکیشن همراه با ارسال مدیا به ادیتور (حل مشکل نوتیفیکیشن)
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
 
         notification_text = f"✅ *تصمیم نهایی مدیر:* محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_data['name']}* نهایی و تایید شد."
         try:
+            # ⬅️ نوتیفیکیشن برای کارفرما
             await context.bot.send_message(project_data['client_chat_id'],
                                            f"🔔 اطلاعیه: {notification_text}",
                                            parse_mode='Markdown')
@@ -1029,12 +1037,15 @@ async def handle_callback(update: Update, context):
             f"✅ محتوای *P{project_id}* توسط مدیر نهایی شد.")
 
         editor_message_prefix = f"🎉 *تایید نهایی:* محتوای شما توسط مدیر نهایی و تایید شد."
+        
+        # ⬅️ نوتیفیکیشن همراه با ارسال مدیا به ادیتور (حل مشکل نوتیفیکیشن)
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
 
         notification_text = f"🎉 محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_data['name']}* توسط مدیر نهایی و تایید شد."
         try:
+            # ⬅️ نوتیفیکیشن برای کارفرما
             await context.bot.send_message(project_data['client_chat_id'],
                                            f"🔔 اطلاعیه: {notification_text}",
                                            parse_mode='Markdown')
