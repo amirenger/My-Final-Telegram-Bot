@@ -1,4 +1,4 @@
 python-telegram-bot
 flask
 gunicorn
-# render fix
+psycopg2-binary

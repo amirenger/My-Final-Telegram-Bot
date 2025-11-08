@@ -70,12 +70,8 @@ def load_project_data():
 
         if result and result[0]:
             PROJECT_DATA = result[0]
-            # logger.info(
-            #     f"✅ داده‌های پروژه از دیتابیس با موفقیت بارگذاری شدند. ({len(PROJECT_DATA)} پروژه)"
-            # ) # ⬅️ لاگ بارگذاری در هر ریکوئست، بیش از حد است، آن را حذف می‌کنیم.
         else:
             PROJECT_DATA = {}
-            # logger.info("⚠️ دیتابیس خالی است. با داده خالی شروع می‌شود.")
 
         cur.close()
         conn.close()
@@ -1071,7 +1067,7 @@ async def handle_callback(update: Update, context):
 
         if not target_submission:
             return await query.edit_message_text(
-                "⚠️ وضعیت محتوا نامعتبری دارد یا قبلاً نهایی شده است.")
+                "⚠️ وضعیت محتوا نامعتبر است یا قبلاً نهایی شده است.")
 
         target_submission['status'] = 'ManagerApproved'
         save_project_data()
@@ -1100,8 +1096,6 @@ async def handle_callback(update: Update, context):
 def build_application():
     """Application را برای Webhook می‌سازد و Handlers را ثبت می‌کند."""
     
-    # ⬅️ بارگذاری داده‌ها از اینجا حذف شد تا در هر ریکوئست انجام شود.
-
     if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
         raise ValueError(
             "❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID باید تنظیم شوند."
