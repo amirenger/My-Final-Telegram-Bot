@@ -4,20 +4,22 @@ import re
 import json
 from uuid import uuid4
 
-# ⬅️ وارد کردن پکیج‌های لازم برای ساختار Webhook و Flask
+# ⬅️ پکیج‌های مورد نیاز
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
 import telegram
+import psycopg2 
+from psycopg2 import sql
 
 # --------------------------------------------------------------------------------------------------
 # ۱. تنظیمات و متغیرهای کلیدی
 # --------------------------------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
-DATA_FILE = 'project_data.json' # ⚠️ NOTE: This file will be lost on server restart/sleep on Render.
-PROJECT_DATA = {}
+DATABASE_URL = os.environ.get("DATABASE_URL") 
+PROJECT_DATA = {} # ⬅️ این متغیر اکنون در هر ریکوئست پر می‌شود.
 
 logging.basicConfig(
     format=
@@ -26,43 +28,89 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------------------
-# ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی)
+# ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی در PostgreSQL)
 # --------------------------------------------------------------------------------------------------
 
 
+def get_db_connection():
+    """اتصال به دیتابیس PostgreSQL با استفاده از DATABASE_URL."""
+    if not DATABASE_URL:
+        logger.error("❌ DATABASE_URL تنظیم نشده است.")
+        raise ValueError("DATABASE_URL environment variable not set.")
+    try:
+        # ⬅️ sslmode='require' برای اتصال امن به دیتابیس در Render ضروری است.
+        conn = psycopg2.connect(DATABASE_URL, sslmode='require') 
+        return conn
+    except Exception as e:
+        logger.error(f"❌ خطای اتصال به دیتابیس: {e}")
+        raise
+
+
 def load_project_data():
-    """
-    ⚠️ هشدار: این تابع از فایل محلی استفاده می‌کند و داده‌ها روی پلتفرم‌هایی مانند Render از بین می‌روند.
-    برای ذخیره سازی دائمی باید از دیتابیس خارجی استفاده شود.
-    """
+    """بارگذاری داده‌های پروژه از دیتابیس و اطمینان از وجود جدول."""
     global PROJECT_DATA
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                PROJECT_DATA = json.load(f)
-            logger.info(
-                f"✅ داده‌های پروژه از '{DATA_FILE}' با موفقیت بارگذاری شدند. ({len(PROJECT_DATA)} پروژه)"
-            )
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"❌ خطای دیکد JSON هنگام بارگذاری داده‌ها: {e}. با داده خالی ادامه می‌یابد."
-            )
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # ۱. ساخت جدول اگر وجود ندارد
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS projects_store (
+                id INTEGER PRIMARY KEY,
+                data JSONB
+            );
+            """
+        )
+        conn.commit()
+
+        # ۲. بازیابی داده‌ها
+        cur.execute("SELECT data FROM projects_store WHERE id = 1;")
+        result = cur.fetchone()
+
+        if result and result[0]:
+            PROJECT_DATA = result[0]
+            # logger.info(
+            #     f"✅ داده‌های پروژه از دیتابیس با موفقیت بارگذاری شدند. ({len(PROJECT_DATA)} پروژه)"
+            # ) # ⬅️ لاگ بارگذاری در هر ریکوئست، بیش از حد است، آن را حذف می‌کنیم.
+        else:
             PROJECT_DATA = {}
-    else:
-        logger.info(
-            f"⚠️ فایل '{DATA_FILE}' یافت نشد. با داده خالی شروع می‌شود.")
+            # logger.info("⚠️ دیتابیس خالی است. با داده خالی شروع می‌شود.")
+
+        cur.close()
+        conn.close()
+
+    except Exception as e:
+        logger.error(f"❌ خطای بارگذاری داده از دیتابیس: {e}")
         PROJECT_DATA = {}
 
 
 def save_project_data():
-    """ذخیره‌سازی داده‌های پروژه در فایل JSON."""
+    """ذخیره‌سازی داده‌های پروژه (کل دیکشنری) در یک سطر دیتابیس."""
     global PROJECT_DATA
     try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(PROJECT_DATA, f, indent=4, ensure_ascii=False)
-        logger.info(f"💾 داده‌های پروژه با موفقیت در '{DATA_FILE}' ذخیره شدند.")
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # UPSERT برای به‌روزرسانی یا درج در صورت عدم وجود (تضمین ذخیره‌سازی)
+        data_json = json.dumps(PROJECT_DATA)
+
+        cur.execute(
+            sql.SQL("""
+            INSERT INTO projects_store (id, data) 
+            VALUES (1, %s)
+            ON CONFLICT (id) 
+            DO UPDATE SET data = EXCLUDED.data;
+            """),
+            (data_json, )
+        )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"💾 داده‌های پروژه با موفقیت در دیتابیس ذخیره شدند.")
     except Exception as e:
-        logger.error(f"❌ خطای ذخیره‌سازی داده‌ها: {e}")
+        logger.error(f"❌ خطای ذخیره‌سازی داده‌ها در دیتابیس: {e}")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -913,11 +961,10 @@ async def handle_callback(update: Update, context):
         await query.edit_message_text(
             f"✅ *تایید شد!* این محتوا برای تایید نهایی مدیر ارسال شد.")
 
-        # ⬅️ **حل مشکل نوتیفیکیشن:** ارسال پیام فوری به ادیتور
+        # ⬅️ **نوتیفیکیشن:** ارسال پیام فوری به ادیتور
         try:
             editor_chat_id = project_data['editor_chat_id']
             project_name = project_data['name']
-            # 🎉 این پیام به ادیتور اطلاع می‌دهد که کارفرما تایید کرده است
             await context.bot.send_message(
                 editor_chat_id,
                 f"🔔 *اطلاعیه:* کارفرما محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_name}* را تایید کرد. محتوا برای تایید نهایی مدیر ارسال شده است.",
@@ -925,7 +972,6 @@ async def handle_callback(update: Update, context):
             )
         except Exception as e:
             logger.error(f"Error sending immediate client approval notification to editor: {e}")
-        # ⬅️ **پایان اصلاحیه**
         
         # ⬅️ این تابع نوتیفیکیشن (با دکمه تایید نهایی) را برای مدیر ارسال می‌کند
         await send_to_manager_for_review(context, project_id,
@@ -963,11 +1009,9 @@ async def handle_callback(update: Update, context):
             [f"  - {fb}" for fb in target_submission['feedback']])
         editor_message_prefix = f"❌ *نیاز به بازبینی:* محتوای شما نیاز به اصلاح دارد.\n\n*بازخوردهای کارفرما:*\n{feedback_list}\n\n*لطفاً پس از اصلاح، فایل جدید را مجدداً با کد پروژه ارسال کنید.*"
         
-        # ⬅️ نوتیفیکیشن همراه با ارسال مدیا به ادیتور (حل مشکل نوتیفیکیشن)
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
-        # ⬅️ نوتیفیکیشن برای کارفرما
         await context.bot.send_message(
             project_data['client_chat_id'],
             f"🔄 *اطلاعیه:* بازخورد شما برای محتوای (ID: {submission_id}) توسط مدیر تایید شد و برای اصلاح به ادیتور بازگشت.",
@@ -999,14 +1043,12 @@ async def handle_callback(update: Update, context):
 
         editor_message_prefix = f"✅ *تایید نهایی:* محتوای شما نهایی و تایید شد (علی‌رغم بازخورد کارفرما، مدیر آن را نهایی کرد)."
         
-        # ⬅️ نوتیفیکیشن همراه با ارسال مدیا به ادیتور (حل مشکل نوتیفیکیشن)
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
 
         notification_text = f"✅ *تصمیم نهایی مدیر:* محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_data['name']}* نهایی و تایید شد."
         try:
-            # ⬅️ نوتیفیکیشن برای کارفرما
             await context.bot.send_message(project_data['client_chat_id'],
                                            f"🔔 اطلاعیه: {notification_text}",
                                            parse_mode='Markdown')
@@ -1038,14 +1080,12 @@ async def handle_callback(update: Update, context):
 
         editor_message_prefix = f"🎉 *تایید نهایی:* محتوای شما توسط مدیر نهایی و تایید شد."
         
-        # ⬅️ نوتیفیکیشن همراه با ارسال مدیا به ادیتور (حل مشکل نوتیفیکیشن)
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
 
         notification_text = f"🎉 محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_data['name']}* توسط مدیر نهایی و تایید شد."
         try:
-            # ⬅️ نوتیفیکیشن برای کارفرما
             await context.bot.send_message(project_data['client_chat_id'],
                                            f"🔔 اطلاعیه: {notification_text}",
                                            parse_mode='Markdown')
@@ -1059,7 +1099,8 @@ async def handle_callback(update: Update, context):
 
 def build_application():
     """Application را برای Webhook می‌سازد و Handlers را ثبت می‌کند."""
-    load_project_data() # ⬅️ اینجا پروژه ها بارگذاری می شوند.
+    
+    # ⬅️ بارگذاری داده‌ها از اینجا حذف شد تا در هر ریکوئست انجام شود.
 
     if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
         raise ValueError(
@@ -1086,9 +1127,8 @@ def build_application():
     return application
 
 # ⬅️ هسته اصلی Flask و Webhook
-# Gunicorn این نمونه 'app' را اجرا می کند.
-app = Flask(__name__)
 # Application ربات در خارج از تابع build_application ساخته می‌شود.
+app = Flask(__name__)
 TG_APPLICATION = build_application()
 
 # ⬅️ آدرس پینگ/Keep Alive (مسیر ریشه /)
@@ -1102,14 +1142,15 @@ def home():
 async def handle_webhook():
     """دریافت به‌روزرسانی (Update) از تلگرام و ارسال به Application."""
     
-    # اطمینان از مقداردهی اولیه Application (ضروری در محیط Webhook/Gunicorn)
+    # 💥💥 رفع قطعی مشکل: بارگذاری داده‌ها در ابتدای هر ریکوئست 💥💥
+    if DATABASE_URL:
+        # این خط تضمین می‌کند که هر Worker (فرآیند) همیشه آخرین PROJECT_DATA را از دیتابیس بخواند
+        load_project_data() 
+        
     await TG_APPLICATION.initialize()
     
     if request.method == "POST":
-        # دریافت داده JSON از درخواست تلگرام
         update = Update.de_json(request.get_json(force=True), TG_APPLICATION.bot)
-        
-        # پردازش آپدیت به صورت ناهمگام (Async)
         await TG_APPLICATION.process_update(update)
         
     return jsonify({"status": "ok"})
