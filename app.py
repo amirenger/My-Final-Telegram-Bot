@@ -1,26 +1,43 @@
 import logging
-import os
-import re
-import json
-from uuid import uuid4
-
-# ⬅️ پکیج‌های مورد نیاز
-from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
+import re
+from uuid import uuid4
+import json
+import os
 import telegram
-import psycopg2 
-from psycopg2 import sql
+# ⬅️ اصلاح شده برای Webhook: از threading صرف نظر شده است.
+from flask import Flask, request, jsonify # ⬅️ اضافه شدن request و jsonify برای مدیریت Webhook
+
+# -----------------
+# کد Flask برای اجرای Webhook
+# -----------------
+app = Flask('')
+
+
+@app.route('/')
+def home():
+    """پاسخ به پینگ سرویس."""
+    # این پیام به Render می‌گوید که سرور فعال است.
+    return "Hello. I am alive!"
+
 
 # --------------------------------------------------------------------------------------------------
-# ۱. تنظیمات و متغیرهای کلیدی
+# ۱. تنظیمات و متغیرهای کلیدی (⚠️ این ۲ مورد را جایگزین کنید)
 # --------------------------------------------------------------------------------------------------
+# توکن ربات تلگرام
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# شناسه عددی چت مدیر (به صورت عدد، داخل رشته)
+# ⬅️ شناسه مدیر از متغیر محیطی 'MANAGER_ID' خوانده می‌شود.
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
-DATABASE_URL = os.environ.get("DATABASE_URL") 
-PROJECT_DATA = {} # ⬅️ این متغیر اکنون در هر ریکوئست پر می‌شود.
+# نام فایل ذخیره سازی
+DATA_FILE = 'project_data.json'
 
+# پایگاه داده پروژه
+PROJECT_DATA = {}
+
+# تنظیمات Logging
 logging.basicConfig(
     format=
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
@@ -28,85 +45,40 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------------------
-# ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی در PostgreSQL)
+# ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی)
 # --------------------------------------------------------------------------------------------------
 
 
-def get_db_connection():
-    """اتصال به دیتابیس PostgreSQL با استفاده از DATABASE_URL."""
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL تنظیم نشده است.")
-        raise ValueError("DATABASE_URL environment variable not set.")
-    try:
-        # ⬅️ sslmode='require' برای اتصال امن به دیتابیس در Render ضروری است.
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require') 
-        return conn
-    except Exception as e:
-        logger.error(f"❌ خطای اتصال به دیتابیس: {e}")
-        raise
-
-
 def load_project_data():
-    """بارگذاری داده‌های پروژه از دیتابیس و اطمینان از وجود جدول."""
+    """بارگذاری داده‌های پروژه از فایل JSON."""
     global PROJECT_DATA
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # ۱. ساخت جدول اگر وجود ندارد
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS projects_store (
-                id INTEGER PRIMARY KEY,
-                data JSONB
-            );
-            """
-        )
-        conn.commit()
-
-        # ۲. بازیابی داده‌ها
-        cur.execute("SELECT data FROM projects_store WHERE id = 1;")
-        result = cur.fetchone()
-
-        if result and result[0]:
-            PROJECT_DATA = result[0]
-        else:
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                PROJECT_DATA = json.load(f)
+            logger.info(
+                f"✅ داده‌های پروژه از '{DATA_FILE}' با موفقیت بارگذاری شدند. ({len(PROJECT_DATA)} پروژه)"
+            )
+        except json.JSONDecodeError as e:
+            logger.error(
+                f"❌ خطای دیکد JSON هنگام بارگذاری داده‌ها: {e}. با داده خالی ادامه می‌یابد."
+            )
             PROJECT_DATA = {}
-
-        cur.close()
-        conn.close()
-
-    except Exception as e:
-        logger.error(f"❌ خطای بارگذاری داده از دیتابیس: {e}")
+    else:
+        logger.info(
+            f"⚠️ فایل '{DATA_FILE}' یافت نشد. با داده خالی شروع می‌شود.")
         PROJECT_DATA = {}
 
 
 def save_project_data():
-    """ذخیره‌سازی داده‌های پروژه (کل دیکشنری) در یک سطر دیتابیس."""
+    """ذخیره‌سازی داده‌های پروژه در فایل JSON."""
     global PROJECT_DATA
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # UPSERT برای به‌روزرسانی یا درج در صورت عدم وجود (تضمین ذخیره‌سازی)
-        data_json = json.dumps(PROJECT_DATA)
-
-        cur.execute(
-            sql.SQL("""
-            INSERT INTO projects_store (id, data) 
-            VALUES (1, %s)
-            ON CONFLICT (id) 
-            DO UPDATE SET data = EXCLUDED.data;
-            """),
-            (data_json, )
-        )
-
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info(f"💾 داده‌های پروژه با موفقیت در دیتابیس ذخیره شدند.")
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(PROJECT_DATA, f, indent=4, ensure_ascii=False)
+        logger.info(f"💾 داده‌های پروژه با موفقیت در '{DATA_FILE}' ذخیره شدند.")
     except Exception as e:
-        logger.error(f"❌ خطای ذخیره‌سازی داده‌ها در دیتابیس: {e}")
+        logger.error(f"❌ خطای ذخیره‌سازی داده‌ها: {e}")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -186,15 +158,14 @@ async def smart_guidance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  callback_data='client_faq')
         ]]
 
-    if update.message:
-        if keyboard:
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(guidance_message,
-                                            reply_markup=reply_markup,
-                                            parse_mode='Markdown')
-        else:
-            await update.message.reply_text(guidance_message,
-                                            parse_mode='Markdown')
+    if keyboard:
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(guidance_message,
+                                        reply_markup=reply_markup,
+                                        parse_mode='Markdown')
+    else:
+        await update.message.reply_text(guidance_message,
+                                        parse_mode='Markdown')
 
 
 async def start(update: Update, context):
@@ -222,10 +193,8 @@ async def new_project(update: Update, context):
         return
 
     if is_callback:
-        # اگر از دکمه داشبورد آمده
         await message.edit_text("💡 لطفاً نام کامل پروژه جدید را وارد کنید:")
     else:
-        # اگر با دستور /new_project آمده
         await message.reply_text("💡 لطفاً نام کامل پروژه جدید را وارد کنید:")
 
     context.user_data['state'] = 'awaiting_project_name'
@@ -294,7 +263,6 @@ async def handle_message(update: Update, context):
                     f"🔔 *پروژه جدید:* مدیر پروژه '{project_name}' (*P{project_id}*) را برای شما ثبت کرد. لطفاً اولین محتوای ادیت شده را با ذکر کد *P{project_id}* در کپشن ارسال کنید."
                 )
             except BadRequest:
-                # این پیام به مدیر نشان داده می شود
                 await update.message.reply_text(
                     f"❌ اخطار: پیام ثبت پروژه برای ادیتور ارسال نشد. (ربات را بلاک کرده است.)"
                 )
@@ -455,10 +423,6 @@ async def handle_media(update: Update, context):
     else:
         file_id = None
         media_type = 'unknown'
-
-    if not file_id:
-        await update.message.reply_text("⚠️ محتوای ارسال شده باید عکس، ویدیو یا فایل باشد.")
-        return
 
     # 2. کپی کردن محتوا برای کارفرما
     try:
@@ -792,7 +756,6 @@ async def handle_callback(update: Update, context):
                     InlineKeyboardButton(f"⚙️ P{pid}: {name}",
                                          callback_data=f'status_{pid}')
                 ] for pid, name in editor_projects]
-                # اطمینان از edit_message_text برای پیام های callback
                 return await query.edit_message_text(
                     project_list_text,
                     reply_markup=InlineKeyboardMarkup(keyboard),
@@ -957,19 +920,6 @@ async def handle_callback(update: Update, context):
         await query.edit_message_text(
             f"✅ *تایید شد!* این محتوا برای تایید نهایی مدیر ارسال شد.")
 
-        # ⬅️ **نوتیفیکیشن:** ارسال پیام فوری به ادیتور
-        try:
-            editor_chat_id = project_data['editor_chat_id']
-            project_name = project_data['name']
-            await context.bot.send_message(
-                editor_chat_id,
-                f"🔔 *اطلاعیه:* کارفرما محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_name}* را تایید کرد. محتوا برای تایید نهایی مدیر ارسال شده است.",
-                parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"Error sending immediate client approval notification to editor: {e}")
-        
-        # ⬅️ این تابع نوتیفیکیشن (با دکمه تایید نهایی) را برای مدیر ارسال می‌کند
         await send_to_manager_for_review(context, project_id,
                                          target_submission,
                                          project_data['name'],
@@ -1004,7 +954,6 @@ async def handle_callback(update: Update, context):
         feedback_list = "\n".join(
             [f"  - {fb}" for fb in target_submission['feedback']])
         editor_message_prefix = f"❌ *نیاز به بازبینی:* محتوای شما نیاز به اصلاح دارد.\n\n*بازخوردهای کارفرما:*\n{feedback_list}\n\n*لطفاً پس از اصلاح، فایل جدید را مجدداً با کد پروژه ارسال کنید.*"
-        
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
@@ -1038,7 +987,6 @@ async def handle_callback(update: Update, context):
         )
 
         editor_message_prefix = f"✅ *تایید نهایی:* محتوای شما نهایی و تایید شد (علی‌رغم بازخورد کارفرما، مدیر آن را نهایی کرد)."
-        
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
@@ -1067,7 +1015,7 @@ async def handle_callback(update: Update, context):
 
         if not target_submission:
             return await query.edit_message_text(
-                "⚠️ وضعیت محتوا نامعتبر است یا قبلاً نهایی شده است.")
+                "⚠️ وضعیت محتوا نامعتبری دارد یا قبلاً نهایی شده است.")
 
         target_submission['status'] = 'ManagerApproved'
         save_project_data()
@@ -1075,7 +1023,6 @@ async def handle_callback(update: Update, context):
             f"✅ محتوای *P{project_id}* توسط مدیر نهایی شد.")
 
         editor_message_prefix = f"🎉 *تایید نهایی:* محتوای شما توسط مدیر نهایی و تایید شد."
-        
         await send_media_to_editor(context, project_data['editor_chat_id'],
                                    project_id, target_submission,
                                    editor_message_prefix)
@@ -1090,17 +1037,26 @@ async def handle_callback(update: Update, context):
 
 
 # --------------------------------------------------------------------------------------------------
-# ۶. اجرای نهایی ربات و ثبت Handlers (ساختار Webhook)
+# ۶. اجرای نهایی ربات و ثبت Handlers (تغییر یافته به Webhook)
 # --------------------------------------------------------------------------------------------------
 
-def build_application():
-    """Application را برای Webhook می‌سازد و Handlers را ثبت می‌کند."""
-    
-    if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
-        raise ValueError(
-            "❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID باید تنظیم شوند."
-        )
+# ⚠️ این متغیر سراسری باید توسط Gunicorn دیده شود
+application = None
 
+
+def setup_application():
+    """هسته اصلی اجرای ربات و ثبت Handlers."""
+    global application
+
+    # مطمئن شوید داده‌ها فقط یک بار در هنگام راه اندازی (توسط Gunicorn) بارگذاری می‌شوند
+    load_project_data()
+
+    if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
+        # در محیط Render، این خطا معمولاً توسط gunicorn دریافت و log می‌شود.
+        print("❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID تنظیم نشده‌اند.")
+        return
+
+    # ساختن Application و ثبت Handlers
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Commands
@@ -1117,34 +1073,35 @@ def build_application():
 
     # Callback Handler
     application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    return application
 
-# ⬅️ هسته اصلی Flask و Webhook
-# Application ربات در خارج از تابع build_application ساخته می‌شود.
-app = Flask(__name__)
-TG_APPLICATION = build_application()
+    # ⚠️ برای حالت Webhook، نیاز به این خط برای جلوگیری از کرش است
+    application.updater = None
 
-# ⬅️ آدرس پینگ/Keep Alive (مسیر ریشه /)
-@app.route('/', methods=['GET'])
-def home():
-    """پاسخ به پینگ UptimeRobot."""
-    return "Hello. I am alive!"
+    print("✅ پیکربندی Handlers با موفقیت انجام شد.")
 
-# ⬅️ آدرس Webhook اصلی (با استفاده از توکن به عنوان مسیر)
-@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
-async def handle_webhook():
-    """دریافت به‌روزرسانی (Update) از تلگرام و ارسال به Application."""
-    
-    # 💥💥 رفع قطعی مشکل: بارگذاری داده‌ها در ابتدای هر ریکوئست 💥💥
-    if DATABASE_URL:
-        # این خط تضمین می‌کند که هر Worker (فرآیند) همیشه آخرین PROJECT_DATA را از دیتابیس بخواند
-        load_project_data() 
-        
-    await TG_APPLICATION.initialize()
-    
-    if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), TG_APPLICATION.bot)
-        await TG_APPLICATION.process_update(update)
-        
-    return jsonify({"status": "ok"})
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=['POST'])
+async def telegram_webhook():
+    """دریافت به‌روزرسانی‌ها از تلگرام و ارسال به ربات."""
+
+    if not application:
+        return jsonify({"status": "error", "message": "Application not initialized"}), 500
+
+    update_json = request.get_json(force=True)
+    update = Update.de_json(update_json, application.bot)
+
+    # ⚠️ اجرای پردازش به‌روزرسانی
+    await application.process_update(update)
+
+    return jsonify({"status": "ok"}), 200
+
+# برای اینکه Gunicorn بداند کدام تابع را هنگام راه‌اندازی اجرا کند، از این قسمت استفاده می‌کنیم.
+# این تابع در زمان بوت شدن Workerهای Gunicorn فراخوانی می‌شود.
+if __name__ != '__main__':
+    # این تابع توسط Gunicorn در هنگام بارگذاری ماژول اجرا می‌شود.
+    setup_application()
+
+if __name__ == '__main__':
+    # این قسمت فقط برای تست محلی است و در Render اجرا نمی‌شود.
+    print("⚠️ توجه: این کد فقط برای تست محلی است. برای Render، Gunicorn سرویس را اجرا خواهد کرد.")
+    pass
