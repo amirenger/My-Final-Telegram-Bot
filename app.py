@@ -1,43 +1,30 @@
 import logging
+import os
+import re
+import json
+from uuid import uuid4
+import psycopg2 # ⬅️ اضافه شدن کتابخانه اتصال به PostgreSQL
+from contextlib import contextmanager
+
+# ⬅️ وارد کردن پکیج‌های لازم برای ساختار Webhook و Flask
+from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest
-import re
-from uuid import uuid4
-import json
-import os
 import telegram
-# ⬅️ اصلاح شده برای Webhook: از threading صرف نظر شده است.
-from flask import Flask, request, jsonify # ⬅️ اضافه شدن request و jsonify برای مدیریت Webhook
-
-# -----------------
-# کد Flask برای اجرای Webhook
-# -----------------
-app = Flask('')
-
-
-@app.route('/')
-def home():
-    """پاسخ به پینگ سرویس."""
-    # این پیام به Render می‌گوید که سرور فعال است.
-    return "Hello. I am alive!"
-
 
 # --------------------------------------------------------------------------------------------------
-# ۱. تنظیمات و متغیرهای کلیدی (⚠️ این ۲ مورد را جایگزین کنید)
+# ۱.
+# تنظیمات و متغیرهای کلیدی
 # --------------------------------------------------------------------------------------------------
-# توکن ربات تلگرام
 TELEGRAM_BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# شناسه عددی چت مدیر (به صورت عدد، داخل رشته)
-# ⬅️ شناسه مدیر از متغیر محیطی 'MANAGER_ID' خوانده می‌شود.
 MANAGER_CHAT_ID = os.environ.get("MANAGER_ID")
-# نام فایل ذخیره سازی
-DATA_FILE = 'project_data.json'
 
-# پایگاه داده پروژه
-PROJECT_DATA = {}
+# ⚠️ متغیر محیطی کلیدی رندر: DATABASE_URL
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# تنظیمات Logging
+PROJECT_DATA = {} # دیکشنری سراسری که داده‌ها را نگه می‌دارد.
+
 logging.basicConfig(
     format=
     '%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(funcName)s',
@@ -45,44 +32,122 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------------------
-# ۱.۵. توابع مدیریت داده (ذخیره سازی دائمی)
+# ۱.۵.
+# 🚀 توابع مدیریت داده (ذخیره سازی دائمی در PostgreSQL رندر)
 # --------------------------------------------------------------------------------------------------
+
+@contextmanager
+def db_connect():
+    """Context Manager برای مدیریت اتصال به دیتابیس و تراکنش‌ها."""
+    if not DATABASE_URL:
+        logger.error("❌ متغیر محیطی DATABASE_URL تنظیم نشده است.")
+        raise ConnectionError("DATABASE_URL is not set.")
+        
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        yield conn
+        conn.commit() # اگر خطایی رخ ندهد، تراکنش ثبت می‌شود.
+    except psycopg2.Error as e:
+        if conn:
+            conn.rollback() # در صورت بروز خطا، تراکنش لغو می‌شود.
+        logger.error(f"❌ خطای دیتابیس: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
+def initialize_db():
+    """تضمین می‌کند که جدول bot_state وجود دارد."""
+    if not DATABASE_URL:
+        return
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cursor:
+                # ایجاد جدول با فیلد JSONB برای ذخیره دیکشنری پروژه
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bot_state (
+                        id INTEGER PRIMARY KEY,
+                        data JSONB
+                    );
+                    """
+                )
+            logger.info("✅ جدول bot_state بررسی و در صورت نیاز ایجاد شد.")
+    except Exception as e:
+        logger.error(f"❌ خطای راه‌اندازی دیتابیس: {e}")
 
 
 def load_project_data():
-    """بارگذاری داده‌های پروژه از فایل JSON."""
+    """
+    بارگذاری داده‌های پروژه از دیتابیس خارجی (PostgreSQL).
+    """
     global PROJECT_DATA
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                PROJECT_DATA = json.load(f)
-            logger.info(
-                f"✅ داده‌های پروژه از '{DATA_FILE}' با موفقیت بارگذاری شدند. ({len(PROJECT_DATA)} پروژه)"
-            )
-        except json.JSONDecodeError as e:
-            logger.error(
-                f"❌ خطای دیکد JSON هنگام بارگذاری داده‌ها: {e}. با داده خالی ادامه می‌یابد."
-            )
-            PROJECT_DATA = {}
-    else:
-        logger.info(
-            f"⚠️ فایل '{DATA_FILE}' یافت نشد. با داده خالی شروع می‌شود.")
+    if not DATABASE_URL:
         PROJECT_DATA = {}
+        logger.warning("⚠️ DATABASE_URL تنظیم نشده است. با داده خالی شروع می‌شود.")
+        return
+
+    logger.info("📡 تلاش برای بارگذاری داده‌ها از دیتابیس PostgreSQL...")
+    
+    try:
+        with db_connect() as conn:
+            with conn.cursor() as cursor:
+                # ID = 1 را برای داده سراسری ربات می‌خواند
+                cursor.execute("SELECT data FROM bot_state WHERE id = 1;")
+                result = cursor.fetchone()
+                
+                if result and result[0]:
+                    # داده‌های JSONB را به دیکشنری پایتون تبدیل می‌کند
+                    PROJECT_DATA = result[0]
+                    logger.info(
+                        f"✅ داده‌های پروژه از دیتابیس با موفقیت بارگذاری شدند. ({len(PROJECT_DATA)} پروژه)"
+                    )
+                else:
+                     logger.info(
+                        f"⚠️ داده‌ای در جدول bot_state یافت نشد. با داده خالی شروع می‌شود.")
+                     PROJECT_DATA = {}
+             
+    except Exception as e:
+        logger.error(f"❌ خطای اتصال/خواندن از دیتابیس: {e}. با داده خالی ادامه می‌یابد.")
+        PROJECT_DATA = {}
+        
 
 
 def save_project_data():
-    """ذخیره‌سازی داده‌های پروژه در فایل JSON."""
+    """
+    ذخیره‌سازی داده‌های پروژه در دیتابیس خارجی (PostgreSQL) با استفاده از Upsert.
+    """
     global PROJECT_DATA
+    if not DATABASE_URL:
+        logger.warning("⚠️ DATABASE_URL تنظیم نشده است. داده‌ها ذخیره نمی‌شوند.")
+        return
+
+    logger.info("💾 تلاش برای ذخیره‌سازی داده‌ها در دیتابیس PostgreSQL...")
+
     try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(PROJECT_DATA, f, indent=4, ensure_ascii=False)
-        logger.info(f"💾 داده‌های پروژه با موفقیت در '{DATA_FILE}' ذخیره شدند.")
+        with db_connect() as conn:
+            with conn.cursor() as cursor:
+                # Upsert: اگر ID=1 وجود دارد، به‌روزرسانی کند. اگر وجود ندارد، درج کند.
+                # داده‌ها به صورت JSON (str) برای ذخیره‌سازی در JSONB ستون ارسال می‌شوند.
+                cursor.execute(
+                    """
+                    INSERT INTO bot_state (id, data) 
+                    VALUES (1, %s)
+                    ON CONFLICT (id) 
+                    DO UPDATE SET data = EXCLUDED.data;
+                    """,
+                    (json.dumps(PROJECT_DATA),)
+                )
+        logger.info(f"✅ داده‌های پروژه با موفقیت در دیتابیس ذخیره شدند.")
     except Exception as e:
-        logger.error(f"❌ خطای ذخیره‌سازی داده‌ها: {e}")
+        logger.error(f"❌ خطای ذخیره‌سازی داده‌ها در دیتابیس: {e}")
 
 
 # --------------------------------------------------------------------------------------------------
-# ۱.۶. توابع کمکی (برای دسترسی و اعتبارسنجی)
+# ۱.۶.
+# توابع کمکی (برای دسترسی و اعتبارسنجی)
 # --------------------------------------------------------------------------------------------------
 
 
@@ -99,7 +164,8 @@ def is_manager(chat_id):
 
 
 # --------------------------------------------------------------------------------------------------
-# ۲. توابع Handlers (مدیریت جریان کار)
+# ۲.
+# توابع Handlers (مدیریت جریان کار)
 # --------------------------------------------------------------------------------------------------
 
 
@@ -112,11 +178,11 @@ async def smart_guidance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_chat_id = str(update.effective_chat.id)
 
     if context.user_data.get('state') and is_manager(user_chat_id):
+        # اگر مدیر در حال ثبت پروژه باشد، پیام متنی او باید توسط handle_message پردازش شود، نه اینجا.
         return
 
     keyboard = []
     guidance_message = "🤔 *نقش نامشخص / کاربر ناشناس.* من این دستور را نمی‌شناسم. لطفاً از دستورات مجاز استفاده کنید."
-
     is_manager_user = is_manager(user_chat_id)
     is_editor = any(
         data.get('editor_chat_id') == user_chat_id
@@ -158,14 +224,15 @@ async def smart_guidance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  callback_data='client_faq')
         ]]
 
-    if keyboard:
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(guidance_message,
-                                        reply_markup=reply_markup,
-                                        parse_mode='Markdown')
-    else:
-        await update.message.reply_text(guidance_message,
-                                        parse_mode='Markdown')
+    if update.message:
+        if keyboard:
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(guidance_message,
+                                            reply_markup=reply_markup,
+                                            parse_mode='Markdown')
+        else:
+            await update.message.reply_text(guidance_message,
+                                            parse_mode='Markdown')
 
 
 async def start(update: Update, context):
@@ -193,8 +260,10 @@ async def new_project(update: Update, context):
         return
 
     if is_callback:
+        # اگر از دکمه داشبورد آمده
         await message.edit_text("💡 لطفاً نام کامل پروژه جدید را وارد کنید:")
     else:
+        # اگر با دستور /new_project آمده
         await message.reply_text("💡 لطفاً نام کامل پروژه جدید را وارد کنید:")
 
     context.user_data['state'] = 'awaiting_project_name'
@@ -211,6 +280,7 @@ async def handle_message(update: Update, context):
         if state == 'awaiting_project_name':
             context.user_data['temp_project_name'] = update.message.text
             context.user_data['state'] = 'awaiting_client_chat_id'
+            # ⬅️ حل مشکل راهنمایی مدیر: نمایش پیام صحیح بعدی
             await update.message.reply_text(
                 "👤 لطفاً *شناسه عددی (Chat ID)* تلگرام کارفرما را وارد کنید:")
             return
@@ -220,6 +290,7 @@ async def handle_message(update: Update, context):
                 client_chat_id = str(int(update.message.text))
                 context.user_data['temp_client_chat_id'] = client_chat_id
                 context.user_data['state'] = 'awaiting_editor_chat_id'
+                # ⬅️ حل مشکل راهنمایی مدیر: نمایش پیام صحیح بعدی
                 await update.message.reply_text(
                     "✂️ لطفاً *شناسه عددی (Chat ID)* تلگرام ادیتور این پروژه را وارد کنید:"
                 )
@@ -254,8 +325,9 @@ async def handle_message(update: Update, context):
             }
             context.user_data['state'] = None
 
-            save_project_data()
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
 
+            # ⬅️ حل مشکل عدم اطلاع به ادیتور
             try:
                 await context.bot.send_message(
                     chat_id=editor_chat_id,
@@ -263,6 +335,7 @@ async def handle_message(update: Update, context):
                     f"🔔 *پروژه جدید:* مدیر پروژه '{project_name}' (*P{project_id}*) را برای شما ثبت کرد. لطفاً اولین محتوای ادیت شده را با ذکر کد *P{project_id}* در کپشن ارسال کنید."
                 )
             except BadRequest:
+                # این پیام به مدیر نشان داده می شود
                 await update.message.reply_text(
                     f"❌ اخطار: پیام ثبت پروژه برای ادیتور ارسال نشد. (ربات را بلاک کرده است.)"
                 )
@@ -301,7 +374,7 @@ async def handle_message(update: Update, context):
                 project_data['client_chat_id'] = new_chat_id
                 role_name = "کارفرما"
 
-            save_project_data()
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
             context.user_data['state'] = None
 
             await update.message.reply_text(
@@ -329,7 +402,7 @@ async def handle_message(update: Update, context):
                     break
 
         if target_submission:
-            # ⬅️ محدودیت ریپلای: اگر وضعیت 'ClientReviewed' باشد، یعنی قبلاً ریپلای کرده است.
+            # ⬅️ حل مشکل عدم هشدار ریپلای دوم (محدودیت یک ریپلای برای بازخورد کارفرما)
             if target_submission.get('status') != 'AwaitingFeedback':
                 await update.message.reply_text(
                     "❌ *اخطار:* شما قبلاً روی این محتوا بازخورد ثبت کرده‌اید. "
@@ -342,9 +415,10 @@ async def handle_message(update: Update, context):
                 target_submission['feedback'].append(update.message.text)
                 target_submission[
                     'status'] = 'ClientReviewed'  # وضعیت تغییر می‌کند و ریپلای دوم مجاز نیست.
-                save_project_data()
+                save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
 
                 try:
+                    # حذف دکمه‌های تایید/رد پس از ثبت بازخورد
                     await context.bot.edit_message_reply_markup(
                         chat_id=user_chat_id,
                         message_id=replied_message_id,
@@ -390,682 +464,629 @@ async def handle_media(update: Update, context):
     match = re.search(r'P(\d+)', caption, re.IGNORECASE)
     if not match:
         await update.message.reply_text(
-            "⚠️ *کد پروژه یافت نشد.* لطفاً در کپشن فایل، حتماً کد پروژه را به فرمت *P[ID]* (مثال: `P12`) ذکر کنید."
+            "⚠️ *کد پروژه یافت نشد.* لطفاً در کپشن فایل، حتماً کد پروژه (مثل *P1*) را ذکر کنید."
         )
         return
 
     project_id = match.group(1)
+    project_data, error = get_project_and_validate(project_id)
 
-    if project_id not in PROJECT_DATA:
-        await update.message.reply_text(f"❌ پروژه *P{project_id}* یافت نشد.")
+    if error:
+        await update.message.reply_text(error)
         return
-
-    project_data = PROJECT_DATA[project_id]
 
     if project_data.get('editor_chat_id') != user_chat_id:
         await update.message.reply_text(
             "⛔️ شما ادیتور تعیین شده برای این پروژه نیستید.")
         return
 
-    client_chat_id = project_data['client_chat_id']
-    project_name = project_data['name']
+    # بررسی وضعیت (فقط در حالت آماده یا بازگشت داده شده)
+    if project_data['status'] not in [
+            'ReadyForEditSubmission', 'ReturnedForRevision'
+    ]:
+        await update.message.reply_text(
+            f"❌ وضعیت پروژه *P{project_id}* اجازه سابمیت جدید را نمی‌دهد. وضعیت فعلی: *{project_data['status']}*"
+        )
+        return
 
-    # ⬅️ ۱. استخراج file_id و media_type
+    # استخراج File ID بر اساس نوع رسانه
+    file_id = None
     if update.message.photo:
+        # بزرگترین سایز عکس را انتخاب می‌کند
         file_id = update.message.photo[-1].file_id
         media_type = 'photo'
     elif update.message.video:
         file_id = update.message.video.file_id
         media_type = 'video'
-    elif update.message.document:  # پشتیبانی از فایل سند
+    elif update.message.document:
         file_id = update.message.document.file_id
         media_type = 'document'
     else:
-        file_id = None
-        media_type = 'unknown'
+        # این حالت نباید رخ دهد چون فیلتر Attachment اعمال شده است.
+        await update.message.reply_text(
+            "⚠️ لطفاً یک فایل (عکس، ویدیو یا سند) ارسال کنید.")
+        return
 
-    # 2. کپی کردن محتوا برای کارفرما
+    # ثبت سابمیشن جدید
+    submission_id = str(uuid4())
+    new_submission = {
+        'submission_id': submission_id,
+        'file_id': file_id,
+        'media_type': media_type,
+        'caption': caption,
+        'status': 'AwaitingFeedback',
+        'editor_message_id': update.message.message_id,
+        'feedback': [],
+        'date': str(update.message.date)
+    }
+
+    project_data['submissions'].append(new_submission)
+    project_data['status'] = 'AwaitingClientReview'  # وضعیت پروژه را تغییر می‌دهد
+    save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
+
+    # 1. اطلاع‌رسانی به کارفرما
+    client_chat_id = project_data['client_chat_id']
+    review_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ تأیید نهایی (محتوا خوب است)",
+            callback_data=f'client_approve_{project_id}_{submission_id}'),
+        InlineKeyboardButton(
+            "↩️ نیاز به بازبینی",
+            callback_data=f'client_reject_{project_id}_{submission_id}'),
+    ]])
+
+    message_text = f"📢 *محتوای جدید آماده:* ادیتور محتوای پروژه (*P{project_id} - {project_data['name']}*) را ارسال کرد.\n\n" \
+                   f"لطفاً محتوا را بررسی کنید و:\n" \
+                   f"1. *بازخورد:* برای ثبت بازخورد، مستقیماً به همین پیام ریپلای کرده و *تمام* نکات را در *یک پیام* بنویسید.\n" \
+                   f"2. *تصمیم‌گیری:* دکمه‌های زیر را برای اتمام کار یا بازگشت به ادیتور فشار دهید."
+
+    # ارسال فایل و پیام همراه با دکمه‌ها برای کارفرما
     try:
-        submission_id = str(uuid4())
+        if media_type == 'photo':
+            client_msg = await context.bot.send_photo(
+                chat_id=client_chat_id,
+                photo=file_id,
+                caption=caption,
+                reply_markup=review_keyboard,
+                parse_mode='Markdown')
+        elif media_type == 'video':
+            client_msg = await context.bot.send_video(
+                chat_id=client_chat_id,
+                video=file_id,
+                caption=caption,
+                reply_markup=review_keyboard,
+                parse_mode='Markdown')
+        elif media_type == 'document':
+            client_msg = await context.bot.send_document(
+                chat_id=client_chat_id,
+                document=file_id,
+                caption=caption,
+                reply_markup=review_keyboard,
+                parse_mode='Markdown')
 
-        client_keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton(
-                "بازخوردی ندارم، تایید نهایی ✅",
-                callback_data=f'client_approve_{project_id}_{submission_id}')
-        ]])
-
-        sent_message = await update.message.copy(chat_id=client_chat_id,
-                                                 caption=caption,
-                                                 reply_markup=client_keyboard)
-
-        # 3. ذخیره اطلاعات
-        new_submission = {
-            "submission_id": submission_id,
-            "media_message_id": sent_message.message_id,
-            "file_id": file_id,
-            "media_type": media_type,
-            "caption": caption,
-            "feedback": [],
-            "status": "AwaitingFeedback"
-        }
-        project_data['submissions'].append(new_submission)
-
-        save_project_data()
-
-        await context.bot.send_message(
-            chat_id=client_chat_id,
-            text=
-            f"✨ *محتوای جدید برای پروژه '{project_name}'* (P{project_id}) رسید.\n"
-            f"1️⃣ *برای تایید:* دکمه زیر محتوا را بزنید.\n"
-            f"2️⃣ *برای درخواست تغییر:* *مستقیماً روی محتوا ریپلای کنید* و نظر خود را بنویسید (فقط یک بار مجاز است)."
-        )
+        # ذخیره message_id محتوای ارسال شده برای کارفرما برای پیگیری ریپلای‌ها
+        new_submission['media_message_id'] = client_msg.message_id
+        save_project_data() # ⬅️ ذخیره message_id در دیتابیس
 
         await update.message.reply_text(
-            f"✅ محتوای ادیت شده با موفقیت برای کارفرما ارسال شد. (Submission ID: {submission_id})"
+            f"✅ محتوا با موفقیت برای کارفرما (*{project_data['client_chat_id']}*) ارسال شد و منتظر بازخورد ایشان است."
         )
 
     except BadRequest as e:
         await update.message.reply_text(
-            f"❌ اخطار: پیام به کارفرما ارسال نشد. (آیدی اشتباه یا ربات بلاک شده است.)"
+            f"❌ اخطار: پیام برای کارفرما ارسال نشد. (احتمالاً ربات را بلاک کرده است.) جزئیات خطا: {e}"
         )
-        project_data['status'] = 'Error_Client_Unreachable_Edit'
 
-
-# --------------------------------------------------------------------------------------------------
-# ۳. توابع گزارش‌گیری و داشبورد
-# --------------------------------------------------------------------------------------------------
-
-
-async def get_status_text(project_id, data, user_chat_id):
-    """تولید پیام وضعیت پروژه."""
-
-    is_manager_user = is_manager(user_chat_id)
-
-    submission_counts = {
-        'AwaitingFeedback': 0,
-        'ClientReviewed': 0,
-        'ClientApproved': 0,
-        'RejectedByClient_AwaitingEditor': 0,
-        'ManagerApproved': 0
-    }
-
-    for sub in data.get('submissions', []):
-        if sub['status'] in submission_counts:
-            submission_counts[sub['status']] += 1
-
-    total_submissions = len(data.get('submissions', []))
-    status_msg = f"پروژه در حال اجراست."
-
-    if is_manager_user:
-        editor_info = f"✂️ ادیتور: *{data.get('editor_chat_id')}*"
-        client_info = f"👤 کارفرما: *{data.get('client_chat_id')}*"
-    else:
-        editor_info = "✂️ ادیتور: 🔒 مخفی"
-        client_info = "👤 کارفرما: 🔒 مخفی"
-
-    return (
-        f"📋 *جزئیات پروژه P{project_id}: {data['name']}*\n"
-        f"وضعیت کلی: *{status_msg}*\n"
-        f"----------------------------------------\n"
-        f"{editor_info}\n"
-        f"{client_info}\n"
-        f"*آمار محتواهای ارسالی ({total_submissions} محتوا):*\n"
-        f" - 🟡 در انتظار بازخورد کارفرما: *{submission_counts['AwaitingFeedback']}*\n"
-        f" - 📝 در انتظار تصمیم مدیر (بازخورد کارفرما): *{submission_counts['ClientReviewed']}*\n"
-        f" - 🟠 در انتظار تایید نهایی مدیر (تایید کارفرما): *{submission_counts['ClientApproved']}*\n"
-        f" - ↩️ برگشت خورده به ادیتور: *{submission_counts['RejectedByClient_AwaitingEditor']}*\n"
-        f" - ✅ نهایی شده: *{submission_counts['ManagerApproved']}*\n")
-
-
-async def check_project_status(update: Update, context):
-    """[وظیفه مدیر/ادیتور]: بررسی وضعیت یک پروژه با ID."""
-    message = update.message if update.message else update.callback_query.message
-    user_chat_id = str(message.chat.id)
-    if not update.message: return
-
-    is_authorized = is_manager(user_chat_id) or any(
-        data.get('editor_chat_id') == user_chat_id
-        for data in PROJECT_DATA.values())
-    if not is_authorized:
-        await message.reply_text(
-            "⛔️ دسترسی محدود: فقط مدیر یا ادیتور مربوط به پروژه می‌تواند وضعیت را چک کند."
-        )
-        return
-
-    if not context.args or not context.args[0].startswith('P'):
-        await message.reply_text("⚠️ فرمت دستور نادرست است. مثال: `/check P1`")
-        return
-
-    project_id = context.args[0][1:]
-
-    project_data, error = get_project_and_validate(project_id)
-    if error:
-        await message.reply_text(error)
-        return
-
-    if not is_manager(user_chat_id) and project_data.get(
-            'editor_chat_id') != user_chat_id:
-        await message.reply_text("⛔️ شما به این پروژه دسترسی ندارید.")
-        return
-
-    status_text = await get_status_text(project_id, project_data, user_chat_id)
-    await message.reply_text(status_text, parse_mode='Markdown')
-
-
-async def dashboard(update: Update, context):
-    """نمایش داشبورد مدیریتی و وضعیت پروژه‌ها."""
-    message = update.message if update.message else update.callback_query.message
-    if not is_manager(message.chat.id):
-        await message.reply_text("⛔️ دسترسی محدود.")
-        return
-
-    total_projects = len(PROJECT_DATA)
-
-    waiting_manager_approval_count = 0
-    for data in PROJECT_DATA.values():
-        for sub in data.get('submissions', []):
-            if sub['status'] in ['ClientApproved', 'ClientReviewed']:
-                waiting_manager_approval_count += 1
-
-    dashboard_text = (
-        "📊 *داشبورد مدیریتی تیم محتوا*\n\n"
-        f"*تعداد کل پروژه‌ها:* {total_projects}\n"
-        f"*↩️ محتوای منتظر تأیید نهایی شما:* {waiting_manager_approval_count}\n"
+    # 2. اطلاع‌رسانی به مدیر
+    await context.bot.send_message(
+        chat_id=MANAGER_CHAT_ID,
+        text=
+        f"🔔 *سابمیت جدید:* ادیتور محتوای پروژه *P{project_id}* را ارسال کرد. منتظر بازخورد کارفرما باشید."
     )
 
-    if waiting_manager_approval_count > 0:
-        dashboard_text += "\n*فوری (نیاز به اقدام مدیر):*\n"
-        for pid, data in PROJECT_DATA.items():
-            for sub in data.get('submissions', []):
-                if sub['status'] == 'ClientApproved':
-                    dashboard_text += f" - P{pid} ({data['name']}): تایید کارفرما، منتظر تایید نهایی شما.\n"
-                elif sub['status'] == 'ClientReviewed':
-                    dashboard_text += f" - P{pid} ({data['name']}): بازخورد کارفرما، منتظر تصمیم شما.\n"
 
-    keyboard = [[
-        InlineKeyboardButton("📄 *نمایش لیست کامل پروژه‌ها*",
-                             callback_data='list_all')
-    ]]
+async def send_to_manager_for_review(context: ContextTypes.DEFAULT_TYPE,
+                                     project_id: str, submission: dict,
+                                     project_name: str, action_type: str):
+    """پیام‌های تصمیم‌گیری (تایید یا رد بازخورد) را برای مدیر ارسال می‌کند."""
+
+    feedback_text = "\n".join(
+        [f"- {fb}" for fb in submission['feedback']])
+
+    if action_type == 'feedback_submitted':
+        manager_message = f"💬 *بازخورد ثبت شد - نیاز به تصمیم‌گیری:* کارفرما برای سابمیت *{submission['submission_id'][:8]}* از پروژه *P{project_id} - {project_name}* بازخورد ثبت کرد.\n\n" \
+                          f"--- بازخورد کارفرما ---\n{feedback_text}\n-----------------------\n\n" \
+                          f"لطفاً تصمیم بگیرید: آیا ادیتور باید بازبینی کند یا بازخورد کارفرما رد شود؟"
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "↩️ بازگشت به ادیتور برای بازبینی",
+                callback_data=
+                f'manager_send_back_{project_id}_{submission["submission_id"]}'
+            ),
+        ], [
+            InlineKeyboardButton(
+                "❌ رد بازخورد (محتوا تأیید شود)",
+                callback_data=
+                f'manager_reject_feedback_{project_id}_{submission["submission_id"]}'
+            )
+        ]])
+
+    elif action_type == 'client_approved':
+        manager_message = f"✅ *تأیید نهایی کارفرما:* کارفرما سابمیت *{submission['submission_id'][:8]}* از پروژه *P{project_id} - {project_name}* را تأیید کرد.\n\n" \
+                          f"لطفاً وضعیت پروژه را به 'تکمیل شده' تغییر دهید."
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "🏁 تکمیل پروژه P{project_id}",
+                callback_data=f'manager_complete_project_{project_id}'),
+        ]])
+
+    elif action_type == 'client_rejected_no_feedback':
+        manager_message = f"❌ *درخواست بازبینی مستقیم:* کارفرما سابمیت *{submission['submission_id'][:8]}* از پروژه *P{project_id} - {project_name}* را مستقیماً (بدون پیام بازخورد) برای بازبینی رد کرد.\n\n" \
+                          f"لطفاً دکمه زیر را فشار دهید تا به ادیتور اطلاع داده شود."
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "↩️ بازگشت به ادیتور برای بازبینی",
+                callback_data=
+                f'manager_send_back_{project_id}_{submission["submission_id"]}'
+            ),
+        ]])
+    else:
+        return
+
+    await context.bot.send_message(chat_id=MANAGER_CHAT_ID,
+                                   text=manager_message,
+                                   reply_markup=keyboard,
+                                   parse_mode='Markdown')
+
+
+async def list_all(update: Update, context):
+    """نمایش لیست کامل پروژه‌ها (فقط برای مدیر)."""
+    if update.callback_query:
+        message = update.callback_query.message
+        chat_id = message.chat.id
+    else:
+        message = update.message
+        chat_id = message.chat.id
+
+    if not is_manager(chat_id):
+        await message.reply_text(
+            "⛔️ دسترسی محدود: این دستور فقط برای مدیر تیم است.")
+        return
+
+    if not PROJECT_DATA:
+        await message.reply_text("🤷‍♂️ هیچ پروژه‌ای ثبت نشده است.")
+        return
+
+    # فیلتر کردن پروژه‌های تکمیل شده برای نمایش کمتر
+    active_projects = {
+        k: v
+        for k, v in PROJECT_DATA.items()
+        if v['status'] != 'Completed'
+    }
+
+    if not active_projects:
+        await message.reply_text("✅ تمام پروژه‌ها تکمیل شده‌اند.")
+        return
+
+    project_list = "*لیست پروژه‌های فعال:*\n\n"
+    for p_id, data in active_projects.items():
+        project_list += (
+            f"🔸 *P{p_id}:* {data['name']}\n"
+            f"  *وضعیت:* {data['status']}\n")
+
+    keyboard = []
+    for p_id, data in active_projects.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                f"🛠️ مدیریت P{p_id}: {data['name']}",
+                callback_data=f'manage_project_{p_id}'),
+        ])
+
+    keyboard.append([
+        InlineKeyboardButton("🗑️ حذف پروژه تکمیل شده",
+                             callback_data='manage_completed')
+    ])
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.callback_query:
-        await message.edit_text(dashboard_text,
-                                reply_markup=reply_markup,
-                                parse_mode='Markdown')
+        try:
+            await message.edit_text(project_list,
+                                    reply_markup=reply_markup,
+                                    parse_mode='Markdown')
+        except BadRequest:
+            await message.reply_text(project_list,
+                                     reply_markup=reply_markup,
+                                     parse_mode='Markdown')
     else:
-        await message.reply_text(dashboard_text,
+        await message.reply_text(project_list,
                                  reply_markup=reply_markup,
                                  parse_mode='Markdown')
 
 
-# --------------------------------------------------------------------------------------------------
-# ۴. توابع ارسال مدیا و نوتیفیکیشن
-# --------------------------------------------------------------------------------------------------
+async def show_project_details(update: Update, context, project_id):
+    """نمایش جزئیات یک پروژه خاص و دکمه‌های مدیریت."""
+    query = update.callback_query
+    project_data, error = get_project_and_validate(project_id)
+    if error:
+        await query.edit_message_text(error)
+        return
+
+    details = f"📋 *جزئیات پروژه P{project_id}:* {project_data['name']}\n" \
+              f"-----------------------------\n" \
+              f"  *وضعیت:* `{project_data['status']}`\n" \
+              f"  *شناسه کارفرما:* `{project_data['client_chat_id']}`\n" \
+              f"  *شناسه ادیتور:* `{project_data['editor_chat_id']}`\n"
+
+    # افزودن اطلاعات سابمیشن‌های اخیر
+    if project_data['submissions']:
+        last_sub = project_data['submissions'][-1]
+        details += (f"-----------------------------\n"
+                    f"  *آخرین سابمیشن (ID: {last_sub['submission_id'][:8]}):*\n"
+                    f"    *وضعیت:* `{last_sub['status']}`\n"
+                    f"    *بازخوردها:* {len(last_sub['feedback'])} مورد\n")
+
+    keyboard = [[
+        InlineKeyboardButton(
+            "تغییر شناسه کارفرما",
+            callback_data=f'change_role_P{project_id}_client'),
+        InlineKeyboardButton(
+            "تغییر شناسه ادیتور",
+            callback_data=f'change_role_P{project_id}_editor'),
+    ], [
+        InlineKeyboardButton("🗑️ حذف پروژه",
+                             callback_data=f'delete_project_{project_id}'),
+        InlineKeyboardButton("↩️ بازگشت به لیست",
+                             callback_data='list_all')
+    ]]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(details,
+                                  reply_markup=reply_markup,
+                                  parse_mode='Markdown')
 
 
-async def send_to_manager_for_review(context, project_id, submission,
-                                     project_name, action_type):
-    """تابع کمکی برای ارسال محتوا و گزارش بازخورد به مدیر جهت تصمیم‌گیری."""
+async def delete_completed(update: Update, context):
+    """حذف پروژه‌های تکمیل شده (فقط مدیر)."""
+    query = update.callback_query
+    if not is_manager(query.message.chat.id):
+        await query.answer("⛔️ دسترسی محدود.", show_alert=True)
+        return
 
-    submission_id = submission['submission_id']
-    raw_feedback_report = submission.get('feedback', [])
+    completed_projects = [
+        k for k, v in PROJECT_DATA.items() if v['status'] == 'Completed'
+    ]
 
-    if action_type == 'approve_without_feedback':
-        raw_feedback_text = "کارفرما هیچ بازخورد متنی ثبت نکرد و مستقیماً محتوا را تایید نهایی کرد."
-        manager_prompt = "🔥 *تایید نهایی مدیر لازم است (تایید کارفرما)*"
-    elif action_type == 'feedback_submitted':
-        raw_feedback_text = "\n".join(
-            [f"  - {fb}" for fb in raw_feedback_report])
-        manager_prompt = "🔥 *تصمیم مدیریتی لازم است (بازخورد کارفرما)*"
-        if not raw_feedback_report:
-            raw_feedback_text = "کارفرما ریپلای کرد اما متن بازخورد خالی بود. نیاز به تصمیم‌گیری مدیر."
+    if not completed_projects:
+        await query.answer("🤷‍♂️ هیچ پروژه تکمیل شده‌ای برای حذف وجود ندارد.",
+                           show_alert=True)
+        await list_all(update, context)
+        return
 
-    # 2. کپی محتوای اصلی برای مدیر (از file_id ذخیره‌شده)
-    if submission['file_id']:
-        manager_caption = f"{manager_prompt}\n\n" \
-                          f"*پروژه:* P{project_id} - {project_name}\n" \
-                          f"*ID محتوا:* {submission_id}\n" \
-                          f"*بازخوردهای کارفرما:*\n" \
-                          f"```\n{raw_feedback_text}```\n" \
-                          f"----------------------------------------\n" \
-                          f"*تصمیم نهایی با شماست:*"
+    for p_id in completed_projects:
+        del PROJECT_DATA[p_id]
 
-        try:
-            if submission['media_type'] == 'photo':
-                await context.bot.send_photo(MANAGER_CHAT_ID,
-                                             submission['file_id'],
-                                             caption=manager_caption,
-                                             parse_mode='Markdown')
-            elif submission['media_type'] == 'video':
-                await context.bot.send_video(MANAGER_CHAT_ID,
-                                             submission['file_id'],
-                                             caption=manager_caption,
-                                             parse_mode='Markdown')
-            elif submission['media_type'] == 'document':  # ارسال فایل عمومی
-                await context.bot.send_document(MANAGER_CHAT_ID,
-                                                submission['file_id'],
-                                                caption=manager_caption,
-                                                parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Error copying media to manager: {e}")
-            await context.bot.send_message(
-                MANAGER_CHAT_ID,
-                f"❌ *خطای ارسال محتوا مدیا* (P{project_id} - {submission_id}): فایل در تلگرام یافت نشد.\n\n"
-                f"{manager_caption}",
-                parse_mode='Markdown')
+    save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
 
-        # 3. ارسال دکمه‌های تصمیم‌گیری به مدیر
-
-        if action_type == 'feedback_submitted':
-            manager_keyboard = InlineKeyboardMarkup(
-                [[
-                    InlineKeyboardButton(
-                        "تایید بازخورد (بازگشت به ادیتور) 🔄",
-                        callback_data=
-                        f'manager_review_accept_{project_id}_{submission_id}')
-                ],
-                 [
-                     InlineKeyboardButton(
-                         "رد بازخورد (تایید نهایی) ✅",
-                         callback_data=
-                         f'manager_review_reject_{project_id}_{submission_id}')
-                 ]])
-            await context.bot.send_message(
-                MANAGER_CHAT_ID,
-                f"👆 محتوای *P{project_id} ({submission_id})* نیاز به تصمیم‌گیری دارد.",
-                reply_markup=manager_keyboard,
-                parse_mode='Markdown')
-
-        elif action_type == 'approve_without_feedback':
-            manager_keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "تایید نهایی مدیر ✅",
-                    callback_data=
-                    f'manager_final_approve_{project_id}_{submission_id}')
-            ]])
-            await context.bot.send_message(
-                MANAGER_CHAT_ID,
-                f"👆 محتوای *P{project_id} ({submission_id})* توسط کارفرما تایید شده. لطفا تایید نهایی کنید.",
-                reply_markup=manager_keyboard,
-                parse_mode='Markdown')
+    await query.answer(f"✅ {len(completed_projects)} پروژه تکمیل شده حذف شد.",
+                       show_alert=True)
+    await list_all(update, context)
 
 
-async def send_media_to_editor(context, editor_chat_id, project_id, submission,
-                               message_prefix):
-    """تابع کمکی برای کپی کردن محتوای اصلی به ادیتور همراه با پیام."""
+async def delete_project(update: Update, context, project_id):
+    """حذف یک پروژه خاص و تایید آن (فقط مدیر)."""
+    query = update.callback_query
+    if not is_manager(query.message.chat.id):
+        await query.answer("⛔️ دسترسی محدود.", show_alert=True)
+        return
 
-    submission_id = submission['submission_id']
+    project_data, error = get_project_and_validate(project_id)
+    if error:
+        await query.edit_message_text(error)
+        return
 
-    if submission['file_id']:
-        editor_caption = f"{message_prefix}\n\n*پروژه:* P{project_id}\n*ID محتوا:* {submission_id}\n"
+    del PROJECT_DATA[project_id]
+    save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
 
-        try:
-            if submission['media_type'] == 'photo':
-                await context.bot.send_photo(editor_chat_id,
-                                             submission['file_id'],
-                                             caption=editor_caption,
-                                             parse_mode='Markdown')
-            elif submission['media_type'] == 'video':
-                await context.bot.send_video(editor_chat_id,
-                                             submission['file_id'],
-                                             caption=editor_caption,
-                                             parse_mode='Markdown')
-            elif submission['media_type'] == 'document':  # ارسال فایل عمومی
-                await context.bot.send_document(editor_chat_id,
-                                                submission['file_id'],
-                                                caption=editor_caption,
-                                                parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Error copying media to editor: {e}")
-            await context.bot.send_message(
-                editor_chat_id,
-                f"❌ *خطای ارسال محتوا* (P{project_id}): فایل محتوا در تلگرام یافت نشد."
-            )
+    await query.edit_message_text(
+        f"✅ پروژه *P{project_id} - {project_data['name']}* با موفقیت حذف شد.",
+        parse_mode='Markdown')
+    await list_all(update, context)
 
 
-# --------------------------------------------------------------------------------------------------
-# ۵. توابع Callback Handler (مدیریت کلیک دکمه‌ها)
-# --------------------------------------------------------------------------------------------------
+async def change_role_prompt(update: Update, context, project_id, role_type):
+    """شروع فرآیند تغییر شناسه ادیتور یا کارفرما."""
+    query = update.callback_query
+    if not is_manager(query.message.chat.id):
+        await query.answer("⛔️ دسترسی محدود.", show_alert=True)
+        return
+
+    role_name = "کارفرما" if role_type == 'client' else "ادیتور"
+    context.user_data[
+        'state'] = f'awaiting_new_role_P{project_id}_{role_type}'
+
+    await query.edit_message_text(
+        f"💡 لطفاً *شناسه عددی (Chat ID)* جدید برای *{role_name}* پروژه *P{project_id}* را وارد کنید."
+    )
 
 
 async def handle_callback(update: Update, context):
-    """مدیریت کلیک روی دکمه های شیشه ای (Inline Buttons)."""
+    """مدیریت تمام فشارهای دکمه‌های Inline."""
     query = update.callback_query
     await query.answer()
+    data = query.data
+    user_chat_id = str(query.message.chat.id)
 
-    data = query.data.split('_')
-    action = data[0]
+    # 1. مدیریت‌های مدیر
+    if is_manager(user_chat_id):
+        if data == 'menu_dashboard' or data == 'menu_new_project':
+            await new_project(query, context)
+            return
 
-    # --- منطق‌های عمومی (منو، داشبورد، وضعیت) ---
-    if action in ['menu', 'editor', 'list', 'status']:
-        if action == 'menu':
-            if data[1] == 'dashboard': return await dashboard(query, context)
-            elif data[1] == 'new' and data[2] == 'project':
-                return await new_project(query, context)
-        elif action == 'editor':
-            editor_id = str(query.message.chat.id)
-            if data[1] == 'my':
-                editor_projects = [(pid, data['name'])
-                                   for pid, data in PROJECT_DATA.items()
-                                   if data.get('editor_chat_id') == editor_id]
-                if not editor_projects:
-                    return await query.edit_message_text(
-                        "شما پروژه فعالی ندارید.")
-                project_list_text = "📋 *پروژه‌های شما:*\n\n"
-                keyboard = [[
-                    InlineKeyboardButton(f"⚙️ P{pid}: {name}",
-                                         callback_data=f'status_{pid}')
-                ] for pid, name in editor_projects]
-                return await query.edit_message_text(
-                    project_list_text,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
+        elif data == 'list_all':
+            await list_all(query, context)
+            return
+
+        elif data.startswith('manage_project_'):
+            project_id = data.split('_')[2]
+            await show_project_details(query, context, project_id)
+            return
+
+        elif data.startswith('delete_project_'):
+            project_id = data.split('_')[2]
+            await delete_project(query, context, project_id)
+            return
+
+        elif data == 'manage_completed':
+            await delete_completed(query, context)
+            return
+
+        elif data.startswith('change_role_'):
+            parts = data.split('_')
+            project_id = parts[2][1:]
+            role_type = parts[3]
+            await change_role_prompt(query, context, project_id, role_type)
+            return
+
+        elif data.startswith('manager_send_back_'):
+            # بازگشت به ادیتور برای بازبینی پس از بازخورد کارفرما یا رد مستقیم
+            _, _, project_id, sub_id = data.split('_')
+            project_data, error = get_project_and_validate(project_id)
+            if error:
+                await query.edit_message_text(error)
+                return
+
+            submission = next(
+                (sub for sub in project_data['submissions']
+                 if sub['submission_id'] == sub_id), None)
+            if not submission:
+                await query.edit_message_text("❌ سابمیشن یافت نشد.")
+                return
+
+            # به‌روزرسانی وضعیت سابمیشن و پروژه
+            submission['status'] = 'ReturnedForRevision'
+            project_data[
+                'status'] = 'ReturnedForRevision'  # پروژه برای بازبینی آماده است
+
+            # ارسال بازخورد و فایل به ادیتور
+            feedback_text = "\n".join(
+                [f"- {fb}" for fb in submission['feedback']])
+            if not feedback_text:
+                feedback_text = "بازخورد متنی از کارفرما ثبت نشده است. لطفاً آخرین فایل را بازبینی کنید."
+
+            message_to_editor = f"↩️ *نیاز به بازبینی:* مدیر سابمیت *{sub_id[:8]}* از پروژه *P{project_id} - {project_data['name']}* را برای بازبینی بازگرداند.\n\n" \
+                                f"--- بازخورد (در صورت وجود) ---\n{feedback_text}\n---------------------------\n" \
+                                f"لطفاً محتوای بازبینی شده را با کد *P{project_id}* دوباره ارسال کنید."
+
+            # ارسال پیام به ادیتور
+            try:
+                await context.bot.send_message(
+                    chat_id=project_data['editor_chat_id'],
+                    text=message_to_editor,
                     parse_mode='Markdown')
+            except BadRequest:
+                await query.edit_message_text(
+                    f"❌ اخطار: پیام بازگشت به ادیتور ارسال نشد. (ربات را بلاک کرده است.)"
+                )
 
-            elif data[1] == 'send' and data[2] == 'guide':
-                guide_text = (
-                    "📢 *راهنمای ارسال محتوای ادیت شده*\n\n"
-                    "1️⃣ *فایل را آماده کنید:* فایل نهایی (عکس، ویدیو یا سند) را برای ارسال انتخاب کنید.\n"
-                    "2️⃣ *کپشن را تنظیم کنید:* در قسمت کپشن فایل، *حتماً* کد پروژه را به فرمت *P[ID]* وارد کنید.\n"
-                    "   مثال: `P12`\n\n"
-                    "   *💡 اگر پروژه شما P5 است، فقط کافی است در کپشن بنویسید P5 یا محتوای کپشن خود را با P5 شروع کنید.*\n\n"
-                    "3️⃣ *ارسال کنید:* ربات به صورت خودکار فایل را به کارفرمای مربوطه ارسال می‌کند.\n\n"
-                    "4️⃣ *بازگشت:*")
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("بازگشت به منو",
-                                         callback_data='menu_dashboard')
-                ]])
-                return await query.edit_message_text(guide_text,
-                                                     reply_markup=keyboard,
-                                                     parse_mode='Markdown')
+            # به‌روزرسانی پیام مدیر و حذف دکمه‌ها
+            await query.edit_message_text(
+                f"✅ سابمیت *{sub_id[:8]}* با موفقیت به ادیتور بازگردانده شد و وضعیت پروژه به 'بازبینی' تغییر کرد."
+            )
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
+            return
 
-        elif action == 'list' and data[1] == 'all':
-            if not is_manager(query.message.chat.id): return
-            manager_projects = [(pid, data['name'])
-                                for pid, data in PROJECT_DATA.items()]
-            project_list_text = "📋 *لیست کامل پروژه‌ها (مدیر):*\n\n"
+        elif data.startswith('manager_reject_feedback_'):
+            # رد بازخورد کارفرما و تکمیل پروژه
+            _, _, project_id, sub_id = data.split('_')
+            project_data, error = get_project_and_validate(project_id)
+            if error:
+                await query.edit_message_text(error)
+                return
 
-            keyboard = []
-            for pid, name in manager_projects:
-                status_button = InlineKeyboardButton(
-                    f"⚙️ P{pid}: {name}", callback_data=f'status_{pid}')
-                manage_buttons = [
-                    InlineKeyboardButton(
-                        "🔄 ادیتور",
-                        callback_data=f'manage_start_P{pid}_editor'),
-                    InlineKeyboardButton(
-                        "🔄 کارفرما",
-                        callback_data=f'manage_start_P{pid}_client'),
-                    InlineKeyboardButton(
-                        "🗑️ حذف",
-                        callback_data=f'manage_confirm_delete_P{pid}')
-                ]
-                keyboard.append([status_button])
-                keyboard.append(manage_buttons)
+            # به‌روزرسانی وضعیت سابمیشن و پروژه
+            submission = next(
+                (sub for sub in project_data['submissions']
+                 if sub['submission_id'] == sub_id), None)
+            if submission:
+                submission['status'] = 'ManagerApproved'
+                submission['feedback'] = [] # بازخورد حذف می‌شود
 
-            return await query.edit_message_text(
-                project_list_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown')
-        elif action == 'status':
-            project_id = data[1]
-            if project_id in PROJECT_DATA:
-                project_data = PROJECT_DATA[project_id]
-                status_text = await get_status_text(project_id, project_data,
-                                                    str(query.message.chat.id))
+            project_data['status'] = 'Completed'
 
-                if is_manager(query.message.chat.id):
-                    back_keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("بازگشت به لیست پروژه‌ها",
-                                             callback_data='list_all')
-                    ]])
-                    return await query.edit_message_text(
-                        status_text,
-                        reply_markup=back_keyboard,
-                        parse_mode='Markdown')
-
-                return await query.edit_message_text(status_text,
-                                                     parse_mode='Markdown')
-            else:
-                return await query.edit_message_text("❌ پروژه یافت نشد.")
-
-    # --- منطق تغییر نقش و حذف (فقط برای مدیر) ---
-    elif action == 'manage' and is_manager(query.message.chat.id):
-        if data[1] == 'start':
-            project_code = data[2]
-            role_type = data[3]
-            project_id = project_code[1:]
-
-            role_name = "ادیتور" if role_type == 'editor' else "کارفرما"
-
-            context.user_data[
-                'state'] = f'awaiting_new_role_{project_code}_{role_type}'
+            # اطلاع‌رسانی به کارفرما و ادیتور
+            try:
+                await context.bot.send_message(
+                    chat_id=project_data['client_chat_id'],
+                    text=
+                    f"❌ *رد بازخورد/تأیید نهایی:* مدیر بازخورد شما را رد و سابمیت *{sub_id[:8]}* را تأیید نهایی کرد. پروژه *P{project_id}* تکمیل شد."
+                )
+                await context.bot.send_message(
+                    chat_id=project_data['editor_chat_id'],
+                    text=
+                    f"✅ *تأیید مدیر:* سابمیت *{sub_id[:8]}* توسط مدیر تأیید شد و پروژه *P{project_id}* تکمیل گردید."
+                )
+            except BadRequest as e:
+                logger.warning(
+                    f"Error sending final message to client/editor: {e}")
 
             await query.edit_message_text(
-                f"🔑 *تغییر {role_name} پروژه P{project_id}:*\n"
-                f"لطفاً *شناسه عددی (Chat ID)* جدید {role_name} را در پیام بعدی ارسال کنید."
+                f"✅ بازخورد کارفرما برای سابمیت *{sub_id[:8]}* رد و پروژه *P{project_id}* تکمیل شد."
+            )
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
+            return
+
+        elif data.startswith('manager_complete_project_'):
+            # تکمیل پروژه پس از تایید نهایی کارفرما
+            project_id = data.split('_')[3]
+            project_data, error = get_project_and_validate(project_id)
+            if error:
+                await query.edit_message_text(error)
+                return
+
+            project_data['status'] = 'Completed'
+
+            # پیدا کردن آخرین سابمیشن و تکمیل آن
+            if project_data['submissions']:
+                last_sub = project_data['submissions'][-1]
+                last_sub['status'] = 'Completed'
+
+            await query.edit_message_text(
+                f"✅ پروژه *P{project_id} - {project_data['name']}* رسماً تکمیل شد."
+            )
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
+
+            # اطلاع‌رسانی به ادیتور
+            try:
+                await context.bot.send_message(
+                    chat_id=project_data['editor_chat_id'],
+                    text=
+                    f"🏁 *پایان کار:* پروژه *P{project_id} - {project_data['name']}* رسماً تکمیل شد. خسته نباشید."
+                )
+            except BadRequest as e:
+                logger.warning(f"Error sending completion message to editor: {e}")
+
+            return
+
+    # 2. مدیریت‌های کارفرما (Client)
+    elif any(data.get('client_chat_id') == user_chat_id
+             for data in PROJECT_DATA.values()):
+        if data.startswith('client_approve_'):
+            # تأیید نهایی محتوا توسط کارفرما
+            _, _, project_id, sub_id = data.split('_')
+            project_data, error = get_project_and_validate(project_id)
+            if error:
+                await query.edit_message_text(error)
+                return
+
+            submission = next(
+                (sub for sub in project_data['submissions']
+                 if sub['submission_id'] == sub_id), None)
+            if not submission:
+                await query.edit_message_text("❌ سابمیشن یافت نشد.")
+                return
+
+            # به‌روزرسانی وضعیت سابمیشن
+            submission['status'] = 'ClientApproved'
+
+            # حذف دکمه‌ها از پیام
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_caption(
+                caption=
+                f"{query.message.caption_html}\n\n✅ *تأیید نهایی شد. در انتظار تکمیل پروژه توسط مدیر.*",
+                parse_mode='HTML')
+
+            # ارسال به مدیر برای تکمیل
+            await send_to_manager_for_review(context, project_id, submission,
+                                             project_data['name'],
+                                             'client_approved')
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
+            return
+
+        elif data.startswith('client_reject_'):
+            # رد محتوا توسط کارفرما (بدون بازخورد متنی)
+            _, _, project_id, sub_id = data.split('_')
+            project_data, error = get_project_and_validate(project_id)
+            if error:
+                await query.edit_message_text(error)
+                return
+
+            submission = next(
+                (sub for sub in project_data['submissions']
+                 if sub['submission_id'] == sub_id), None)
+            if not submission:
+                await query.edit_message_text("❌ سابمیشن یافت نشد.")
+                return
+
+            # به‌روزرسانی وضعیت سابمیشن
+            submission['status'] = 'ClientRejectedNoFeedback'
+
+            # حذف دکمه‌ها و درخواست ریپلای
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_caption(
+                caption=
+                f"{query.message.caption_html}\n\n❌ *رد شد. منتظر تصمیم‌گیری مدیر.*",
+                parse_mode='HTML')
+
+            # ارسال به مدیر برای تصمیم‌گیری
+            await send_to_manager_for_review(context, project_id, submission,
+                                             project_data['name'],
+                                             'client_rejected_no_feedback')
+            save_project_data() # ⬅️ ذخیره دائمی در دیتابیس
+            return
+
+    # 3. مدیریت‌های ادیتور (Editor)
+    elif any(data.get('editor_chat_id') == user_chat_id
+             for data in PROJECT_DATA.values()):
+        if data == 'editor_my_projects':
+            # نمایش لیست پروژه‌های ادیتور
+            editor_projects = [
+                f"🔸 *P{k}:* {v['name']} (وضعیت: {v['status']})"
+                for k, v in PROJECT_DATA.items()
+                if v['editor_chat_id'] == user_chat_id
+            ]
+            message_text = "📝 *پروژه‌های شما:*\n\n" + "\n".join(
+                editor_projects)
+            await query.edit_message_text(message_text, parse_mode='Markdown')
+            return
+
+        elif data == 'editor_send_guide':
+            await query.edit_message_text(
+                "📢 *راهنمای ارسال محتوا:*\n\n"
+                "1. فایل (عکس، ویدیو یا سند) خود را آماده کنید.\n"
+                "2. در کپشن آن، *حتماً* کد پروژه را به صورت `P[ID]` (مثلاً `P1`) ذکر کنید.\n"
+                "3. فایل را ارسال کنید. ربات به طور خودکار آن را برای کارفرما می‌فرستد."
             )
             return
-        elif data[1] == 'confirm' and data[2] == 'delete':
-            project_code = data[3]
-            project_id = project_code[1:]
 
-            if project_id in PROJECT_DATA:
-                project_name = PROJECT_DATA[project_id]['name']
-
-                confirm_keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        f"⚠️ *تایید حذف نهایی P{project_id}*",
-                        callback_data=f'manage_execute_delete_P{project_id}')
-                ], [
-                    InlineKeyboardButton("❌ انصراف", callback_data='list_all')
-                ]])
-                await query.edit_message_text(
-                    f"⚠️ *اخطار حذف!* آیا مطمئن هستید که می‌خواهید پروژه *'{project_name}' (P{project_id})* را برای همیشه حذف کنید؟",
-                    reply_markup=confirm_keyboard,
-                    parse_mode='Markdown')
-            else:
-                await query.edit_message_text(
-                    f"❌ پروژه P{project_id} یافت نشد.")
-            return
-        elif data[1] == 'execute' and data[2] == 'delete':
-            project_code = data[3]
-            project_id = project_code[1:]
-
-            if project_id in PROJECT_DATA:
-                project_name = PROJECT_DATA[project_id]['name']
-                del PROJECT_DATA[project_id]
-
-                save_project_data()
-
-                await query.edit_message_text(
-                    f"🗑️ پروژه *'{project_name}' (P{project_id})* با موفقیت *حذف نهایی* شد."
-                )
-                await dashboard(query, context)
-            else:
-                await query.edit_message_text(
-                    f"❌ پروژه P{project_id} یافت نشد.")
-            return
-
-    # --- منطق کارفرما (بازخورد و تایید) ---
-
-    if action == 'client' and data[1] == 'faq':
-        return await query.edit_message_text(
-            "❓ *سوالات متداول کارفرما:*\n"
-            "1️⃣ *برای تایید سریع:* دکمه *'بازخوردی ندارم، تایید نهایی ✅'* را بزنید.\n"
-            "2️⃣ *برای درخواست تغییر:* *مستقیماً روی محتوای ارسالی ریپلای کنید* و نظر خود را بنویسید (فقط یک بار مجاز است)."
-        )
-
-    if action == 'client' and data[1] == 'approve':
-        project_id = data[2]
-        submission_id = data[3]
-
-        project_data = PROJECT_DATA.get(project_id)
-        if not project_data or str(
-                query.message.chat.id) != project_data['client_chat_id']:
-            return
-
-        target_submission = next((sub for sub in project_data['submissions']
-                                  if sub['submission_id'] == submission_id),
-                                 None)
-
-        if not target_submission or target_submission[
-                'status'] != 'AwaitingFeedback':
-            await query.edit_message_text(
-                "⚠️ این محتوا قبلاً بررسی شده یا وضعیت نامعتبری دارد.")
-            return
-
-        target_submission['status'] = 'ClientApproved'
-        save_project_data()
-
+    # 4. سایر دکمه‌ها (ناشناس یا منوهای نامربوط)
+    else:
         await query.edit_message_text(
-            f"✅ *تایید شد!* این محتوا برای تایید نهایی مدیر ارسال شد.")
-
-        await send_to_manager_for_review(context, project_id,
-                                         target_submission,
-                                         project_data['name'],
-                                         'approve_without_feedback')
-        return
-
-    # --- منطق‌های تصمیم‌گیری مدیر ---
-
-    # 1. تایید بازخورد کارفرما (بازگشت به ادیتور) 🔄
-    elif action == 'manager' and data[1] == 'review' and data[2] == 'accept':
-        project_id = data[3]
-        submission_id = data[4]
-
-        if not is_manager(
-                query.message.chat.id) or project_id not in PROJECT_DATA:
-            return
-
-        project_data = PROJECT_DATA[project_id]
-        target_submission = next((sub for sub in project_data['submissions']
-                                  if sub['submission_id'] == submission_id
-                                  and sub['status'] == 'ClientReviewed'), None)
-
-        if not target_submission:
-            return await query.edit_message_text("⚠️ وضعیت محتوا نامعتبر است.")
-
-        target_submission['status'] = 'RejectedByClient_AwaitingEditor'
-        save_project_data()
-        await query.edit_message_text(
-            f"🔄 *بازگشت به ادیتور:* بازخورد کارفرما برای محتوای *P{project_id}* توسط مدیر تایید شد."
-        )
-
-        feedback_list = "\n".join(
-            [f"  - {fb}" for fb in target_submission['feedback']])
-        editor_message_prefix = f"❌ *نیاز به بازبینی:* محتوای شما نیاز به اصلاح دارد.\n\n*بازخوردهای کارفرما:*\n{feedback_list}\n\n*لطفاً پس از اصلاح، فایل جدید را مجدداً با کد پروژه ارسال کنید.*"
-        await send_media_to_editor(context, project_data['editor_chat_id'],
-                                   project_id, target_submission,
-                                   editor_message_prefix)
-        await context.bot.send_message(
-            project_data['client_chat_id'],
-            f"🔄 *اطلاعیه:* بازخورد شما برای محتوای (ID: {submission_id}) توسط مدیر تایید شد و برای اصلاح به ادیتور بازگشت.",
-            parse_mode='Markdown')
-        target_submission['feedback'] = []
-
-    # 2. رد بازخورد کارفرما (تایید نهایی محتوا) ✅
-    elif action == 'manager' and data[1] == 'review' and data[2] == 'reject':
-        project_id = data[3]
-        submission_id = data[4]
-
-        if not is_manager(
-                query.message.chat.id) or project_id not in PROJECT_DATA:
-            return
-
-        project_data = PROJECT_DATA[project_id]
-        target_submission = next((sub for sub in project_data['submissions']
-                                  if sub['submission_id'] == submission_id
-                                  and sub['status'] == 'ClientReviewed'), None)
-
-        if not target_submission:
-            return await query.edit_message_text("⚠️ وضعیت محتوا نامعتبر است.")
-
-        target_submission['status'] = 'ManagerApproved'
-        save_project_data()
-        await query.edit_message_text(
-            f"✅ محتوای *P{project_id}* توسط مدیر نهایی شد (بازخورد کارفرما رد شد)."
-        )
-
-        editor_message_prefix = f"✅ *تایید نهایی:* محتوای شما نهایی و تایید شد (علی‌رغم بازخورد کارفرما، مدیر آن را نهایی کرد)."
-        await send_media_to_editor(context, project_data['editor_chat_id'],
-                                   project_id, target_submission,
-                                   editor_message_prefix)
-
-        notification_text = f"✅ *تصمیم نهایی مدیر:* محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_data['name']}* نهایی و تایید شد."
-        try:
-            await context.bot.send_message(project_data['client_chat_id'],
-                                           f"🔔 اطلاعیه: {notification_text}",
-                                           parse_mode='Markdown')
-        except:
-            pass
-
-    # --- تایید نهایی مدیر (حالت تایید سریع کارفرما) ---
-    elif action == 'manager' and data[1] == 'final' and data[2] == 'approve':
-        project_id = data[3]
-        submission_id = data[4]
-
-        if not is_manager(
-                query.message.chat.id) or project_id not in PROJECT_DATA:
-            return
-
-        project_data = PROJECT_DATA[project_id]
-        target_submission = next((sub for sub in project_data['submissions']
-                                  if sub['submission_id'] == submission_id
-                                  and sub['status'] == 'ClientApproved'), None)
-
-        if not target_submission:
-            return await query.edit_message_text(
-                "⚠️ وضعیت محتوا نامعتبری دارد یا قبلاً نهایی شده است.")
-
-        target_submission['status'] = 'ManagerApproved'
-        save_project_data()
-        await query.edit_message_text(
-            f"✅ محتوای *P{project_id}* توسط مدیر نهایی شد.")
-
-        editor_message_prefix = f"🎉 *تایید نهایی:* محتوای شما توسط مدیر نهایی و تایید شد."
-        await send_media_to_editor(context, project_data['editor_chat_id'],
-                                   project_id, target_submission,
-                                   editor_message_prefix)
-
-        notification_text = f"🎉 محتوای شما (ID: {submission_id}) از پروژه *P{project_id} - {project_data['name']}* توسط مدیر نهایی و تایید شد."
-        try:
-            await context.bot.send_message(project_data['client_chat_id'],
-                                           f"🔔 اطلاعیه: {notification_text}",
-                                           parse_mode='Markdown')
-        except:
-            pass
+            "🤷‍♂️ این گزینه برای نقش شما یا وضعیت فعلی معتبر نیست.")
 
 
 # --------------------------------------------------------------------------------------------------
-# ۶. اجرای نهایی ربات و ثبت Handlers (تغییر یافته به Webhook)
+# ۶.
+# اجرای نهایی ربات و ثبت Handlers (ساختار Webhook)
 # --------------------------------------------------------------------------------------------------
 
-# ⚠️ این متغیر سراسری باید توسط Gunicorn دیده شود
-application = None
-
-
-def setup_application():
-    """هسته اصلی اجرای ربات و ثبت Handlers."""
-    global application
-
-    # مطمئن شوید داده‌ها فقط یک بار در هنگام راه اندازی (توسط Gunicorn) بارگذاری می‌شوند
-    load_project_data()
-
-    if not TELEGRAM_BOT_TOKEN or not MANAGER_CHAT_ID:
-        # در محیط Render، این خطا معمولاً توسط gunicorn دریافت و log می‌شود.
-        print("❌ خطای پیکربندی: مقادیر BOT_TOKEN و MANAGER_ID تنظیم نشده‌اند.")
-        return
-
-    # ساختن Application و ثبت Handlers
+def build_application():
+    """Application را برای Webhook می‌سازد و Handlers را ثبت می‌کند."""
+    
+    initialize_db() # ⬅️ اطمینان از وجود جدول دیتابیس
+    load_project_data() # ⬅️ اکنون از دیتابیس خارجی بارگذاری می‌کند
+    
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Commands
+    # Command Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("new_project", new_project))
-    application.add_handler(CommandHandler("dashboard", dashboard))
-    application.add_handler(CommandHandler("check", check_project_status))
+    application.add_handler(CommandHandler("dashboard", list_all))
+    application.add_handler(CommandHandler("list_all", list_all))
 
     # Message Handlers
+    # filters.ATTACHMENT شامل عکس، ویدیو، سند و فایل‌های دیگر است.
     application.add_handler(
         MessageHandler(filters.ATTACHMENT, handle_media))
     application.add_handler(
@@ -1073,35 +1094,42 @@ def setup_application():
 
     # Callback Handler
     application.add_handler(CallbackQueryHandler(handle_callback))
+    
+    return application
 
-    # ⚠️ برای حالت Webhook، نیاز به این خط برای جلوگیری از کرش است
-    application.updater = None
+# ⬅️ هسته اصلی Flask و Webhook
+# Gunicorn این نمونه 'app' را اجرا می کند.
+app = Flask(__name__)
+# Application ربات در خارج از تابع build_application ساخته می‌شود.
+TG_APPLICATION = build_application()
 
-    print("✅ پیکربندی Handlers با موفقیت انجام شد.")
+# ⬅️ آدرس پینگ/Keep Alive (مسیر ریشه /)
+@app.route('/', methods=['GET'])
+def home():
+    """پاسخ به پینگ UptimeRobot."""
+    return "Hello. I am alive!"
 
-
-@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=['POST'])
-async def telegram_webhook():
-    """دریافت به‌روزرسانی‌ها از تلگرام و ارسال به ربات."""
-
-    if not application:
-        return jsonify({"status": "error", "message": "Application not initialized"}), 500
-
-    update_json = request.get_json(force=True)
-    update = Update.de_json(update_json, application.bot)
-
-    # ⚠️ اجرای پردازش به‌روزرسانی
-    await application.process_update(update)
-
-    return jsonify({"status": "ok"}), 200
-
-# برای اینکه Gunicorn بداند کدام تابع را هنگام راه‌اندازی اجرا کند، از این قسمت استفاده می‌کنیم.
-# این تابع در زمان بوت شدن Workerهای Gunicorn فراخوانی می‌شود.
-if __name__ != '__main__':
-    # این تابع توسط Gunicorn در هنگام بارگذاری ماژول اجرا می‌شود.
-    setup_application()
-
-if __name__ == '__main__':
-    # این قسمت فقط برای تست محلی است و در Render اجرا نمی‌شود.
-    print("⚠️ توجه: این کد فقط برای تست محلی است. برای Render، Gunicorn سرویس را اجرا خواهد کرد.")
-    pass
+# ⬅️ آدرس Webhook اصلی (با استفاده از توکن به عنوان مسیر)
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+async def handle_webhook():
+    """دریافت به‌روزرسانی (Update) از تلگرام و ارسال به Application."""
+    
+    # اطمینان از مقداردهی اولیه Application (ضروری در محیط Webhook/Gunicorn)
+    await TG_APPLICATION.initialize()
+    
+    if request.method == "POST":
+        try:
+            # دریافت داده خام JSON از تلگرام
+            update_data = request.get_json(force=True)
+            if update_data:
+                # تبدیل به آبجکت Update تلگرام و پردازش
+                update = Update.de_json(update_data, TG_APPLICATION.bot)
+                await TG_APPLICATION.process_update(update)
+                return jsonify({"status": "ok"}), 200
+            else:
+                return jsonify({"status": "no update data"}), 200
+        except Exception as e:
+            logger.error(f"❌ خطای پردازش Webhook: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    
+    return jsonify({"status": "method not allowed"}), 405
